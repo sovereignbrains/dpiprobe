@@ -290,6 +290,24 @@ func printDNS(d probe.DNSReport) {
 	w.Flush()
 }
 
+// oneEgress: every resolver was answered from the same network — what a VPN
+// client looks like when it captures all DNS (sing-box hijack-dns and the like).
+func oneEgress(d *probe.DNSReport) bool {
+	asn := 0
+	for _, s := range d.Servers {
+		if s.Egress == "" {
+			continue
+		}
+		if asn == 0 {
+			asn = s.EgressAS.ASN
+		}
+		if s.EgressAS.ASN == 0 || s.EgressAS.ASN != asn {
+			return false
+		}
+	}
+	return asn != 0
+}
+
 // summarize folds repeated details: "NXDOMAIN ×5" instead of five lines.
 func summarize(items []string) string {
 	var order []string
@@ -405,7 +423,10 @@ func printSummary(r report) {
 				}
 			}
 		}
+		vpnOn := r.Net != nil && len(r.Net.VPNIfaces) > 0
 		switch {
+		case len(hijacked) > 0 && vpnOn && oneEgress(r.DNS):
+			fmt.Fprintln(out, "  • DNS-запросы забирает VPN-клиент и отвечает сам — так и задумано, провайдер их не видит.")
 		case len(hijacked) > 0:
 			fmt.Fprintf(out, "  • DNS перехватывается: запросы к %s отвечает чужой резолвер. Нужен DoH/DoT.\n", strings.Join(hijacked, ", "))
 		case len(spoofed) > 0:
