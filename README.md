@@ -21,7 +21,17 @@ dpiprobe.exe -domains youtube.com,x.com       # свои домены вмест
 
 Флаги: `-only net,dns,tls,tcp16,tg`, `-target host[:port][@sni],…`, `-domains …`, `-json файл`, `-parallel 8`, `-timeout 8s`, `-sni=false` (не искать белые SNI).
 
-Сборка из исходников: `go build ./cmd/dpiprobe` (Go 1.27+). Linux и macOS тоже собираются.
+Сборка из исходников: `go build ./cmd/dpiprobe` (Go 1.27+). В релизах есть и готовые файлы для Linux и macOS.
+
+## Можно ли доверять exe
+
+Релизы собирает GitHub Actions ([release.yml](.github/workflows/release.yml)) из открытого кода, на компьютере автора exe не собирается. Каждый файл подписан аттестацией GitHub: она подтверждает, что файл собран этим workflow из конкретного коммита этого репозитория.
+
+```
+gh attestation verify dpiprobe.exe --repo sovereignbrains/dpiprobe
+```
+
+Без `gh` — сверьте SHA-256 со списком в описании релиза (`Get-FileHash dpiprobe.exe` в PowerShell, `sha256sum` в Linux). Или соберите сами — зависимостей нет.
 
 ## Что проверяется
 
