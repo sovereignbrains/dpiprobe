@@ -34,12 +34,12 @@ gh attestation verify dpiprobe.exe --repo sovereignbrains/dpiprobe
 
 Без `gh` — сверьте SHA-256 со списком в описании релиза (`Get-FileHash dpiprobe.exe` в PowerShell, `sha256sum` в Linux).
 
-**Не доверять никому, даже GitHub.** Сборка воспроизводимая: из того же тега той же версией Go получается побайтно тот же exe. Соберите сами и сравните хеш с релизным — совпал, значит в релизе ровно этот код. Версия Go — строка `go` в `go.mod` этого тега (для v0.2.0 — 1.27.0); нужной версии Go не будет — `GOTOOLCHAIN` скачает её сам.
+**Не доверять никому, даже GitHub.** Сборка воспроизводимая: из того же тега той же версией Go получается побайтно тот же exe. Соберите сами и сравните хеш с релизным — совпал, значит в релизе ровно этот код. Версия Go — строка `go` в `go.mod` этого тега (для v0.2.1 — 1.27.0); нужной версии Go не будет — `GOTOOLCHAIN` скачает её сам.
 
 PowerShell:
 
 ```
-git clone https://github.com/sovereignbrains/dpiprobe; cd dpiprobe; git checkout v0.2.0
+git clone https://github.com/sovereignbrains/dpiprobe; cd dpiprobe; git checkout v0.2.1
 $env:GOTOOLCHAIN='go1.27.0'; $env:GOOS='windows'; $env:GOARCH='amd64'; $env:CGO_ENABLED='0'
 go build -trimpath -ldflags "-s -w" -o dpiprobe.exe ./cmd/dpiprobe
 Get-FileHash dpiprobe.exe
@@ -48,7 +48,7 @@ Get-FileHash dpiprobe.exe
 Linux/macOS:
 
 ```
-git clone https://github.com/sovereignbrains/dpiprobe && cd dpiprobe && git checkout v0.2.0
+git clone https://github.com/sovereignbrains/dpiprobe && cd dpiprobe && git checkout v0.2.1
 GOTOOLCHAIN=go1.27.0 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o dpiprobe.exe ./cmd/dpiprobe
 sha256sum dpiprobe.exe
 ```

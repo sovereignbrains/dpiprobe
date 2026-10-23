@@ -213,7 +213,12 @@ func (p *Prober) quicCross(ctx context.Context, r *QUICResult, control, ru strin
 		}
 		return
 	}
-	foreign, _ := p.quicProbe(ctx, control, 443, domain)
+	// "The name is cut" rests on this probe alone, and UDP gets lost: one
+	// silent try is not enough to call it.
+	foreign := ""
+	for try := 0; try < 3 && foreign != "OK"; try++ {
+		foreign, _ = p.quicProbe(ctx, control, 443, domain)
+	}
 	switch {
 	case sameIP == "OK" && foreign != "OK":
 		r.Verdict = "DPI по SNI: имя режется и на чистом адресе"

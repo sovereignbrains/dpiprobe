@@ -442,7 +442,7 @@ func printQUICSummary(q probe.QUICReport, tls []probe.TLSResult, vpnOn bool) {
 		}
 		fmt.Fprintf(out, "  • QUIC: отвечают %d из %d сайтов, режут по SNI: %d.", ok, len(q.Sites), sni)
 		if sni > 0 {
-			fmt.Fprint(out, " UDP-протоколы (Hysteria2, TUIC) проходят только с нейтральным SNI.")
+			fmt.Fprint(out, " Часть имён режут и в QUIC: для Hysteria2 и TUIC берите нейтральный SNI.")
 		} else if ok > 0 {
 			fmt.Fprint(out, " UDP за рубеж проходит хотя бы к части адресов; свой сервер проверьте: -target адрес:порт.")
 		}
