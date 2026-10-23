@@ -20,7 +20,7 @@ var quicForeignControls = []string{"www.google.com", "www.youtube.com", "cloudfl
 type QUICResult struct {
 	Domain  string
 	IP      string
-	Status  string // OK, NO REPLY, or a socket/packet error
+	Status  string // OK, NO REPLY, FAKE, ICMP, or a socket/packet error
 	Verdict string
 	RTT     time.Duration
 	// PassesToRU: the blocked name got a reply from a Russian address.
@@ -42,10 +42,12 @@ type QUICReport struct {
 
 func (p *Prober) quicWait() time.Duration { return min(p.Timeout, 3*time.Second) }
 
-// quicProbe sends one Initial and waits for any QUIC reply. A second copy
-// goes out after a second: a single lost datagram is not a block.
+// quicProbe sends one Initial and waits for the server's reply. A second copy
+// goes out after a second: a single lost datagram is not a block. "FAKE":
+// only QUIC-looking datagrams not addressed to us came back — something on
+// the way answers instead of the server.
 func (p *Prober) quicProbe(ctx context.Context, ip string, port int, sni string) (string, time.Duration) {
-	pkt, err := buildQUICInitial(ctx, sni, []string{"h3"})
+	pkt, scid, err := buildQUICInitial(ctx, sni, []string{"h3"})
 	if err != nil {
 		return "ERR", 0
 	}
@@ -62,7 +64,7 @@ func (p *Prober) quicProbe(ctx context.Context, ip string, port int, sni string)
 		return "ERR", 0
 	}
 	resend := t0.Add(min(time.Second, p.quicWait()/2))
-	resent := false
+	resent, fake := false, false
 	buf := make([]byte, 2048)
 	for {
 		if !resent {
@@ -72,9 +74,10 @@ func (p *Prober) quicProbe(ctx context.Context, ip string, port int, sni string)
 		}
 		n, err := c.Read(buf)
 		if err == nil {
-			if quicReply(buf[:n]) {
+			if quicReply(buf[:n], scid) {
 				return "OK", time.Since(t0)
 			}
+			fake = fake || quicLongHeader(buf[:n])
 			continue
 		}
 		if kindOf(err) == kUnreach || kindOf(err) == kRefused || kindOf(err) == kReset {
@@ -82,6 +85,9 @@ func (p *Prober) quicProbe(ctx context.Context, ip string, port int, sni string)
 			return "ICMP", 0
 		}
 		if resent || ctx.Err() != nil || time.Now().After(deadline) {
+			if fake {
+				return "FAKE", 0
+			}
 			return "NO REPLY", 0
 		}
 		resent = true
@@ -189,6 +195,10 @@ func (p *Prober) quicFirst(ctx context.Context, domain string) QUICResult {
 
 // quicCross explains a site that stayed silent with its own name.
 func (p *Prober) quicCross(ctx context.Context, r *QUICResult, control, ru string) {
+	if r.Status == "FAKE" {
+		r.Verdict = "ответил не сервер: пакет на чужой запрос, QUIC перехватывают по пути"
+		return
+	}
 	domain := r.Domain
 	sameIP, _ := p.quicProbe(ctx, r.IP, 443, tlsRUControl)
 	if ru != "" {
@@ -244,6 +254,8 @@ func (p *Prober) checkQUICTarget(ctx context.Context, t Target) QUICResult {
 		r.Verdict = "сервер отвечает по UDP"
 	case "ICMP":
 		r.Verdict = "порт закрыт: на этом порту UDP-сервера нет"
+	case "FAKE":
+		r.Verdict = "ответил не сервер: QUIC к нему перехватывают по пути"
 	default:
 		if sni != tlsRUControl {
 			if st, _ := p.quicProbe(ctx, r.IP, t.Port, tlsRUControl); st == "OK" {

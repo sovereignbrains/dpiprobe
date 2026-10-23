@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -14,8 +15,8 @@ import (
 
 // A QUIC Initial packet (RFC 9000, RFC 9001) carrying a real TLS ClientHello:
 // DPI reads the SNI out of it exactly as it would from a browser. The probe
-// never decrypts the reply — any long-header datagram back is proof that the
-// server got the packet.
+// never decrypts the reply: a long-header datagram addressed to our source
+// connection ID is proof that the server got the packet.
 
 var quicV1Salt = []byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a}
 
@@ -121,16 +122,17 @@ func quicClientHello(ctx context.Context, sni string, alpn []string, scid []byte
 
 // buildQUICInitial returns one Initial datagram, padded to 1200 bytes as
 // RFC 9000 requires of a client — servers drop shorter ones.
-func buildQUICInitial(ctx context.Context, sni string, alpn []string) ([]byte, error) {
+// The source connection ID comes back too: every server reply carries it.
+func buildQUICInitial(ctx context.Context, sni string, alpn []string) (pkt, scid []byte, err error) {
 	dcid := make([]byte, 8)
-	scid := make([]byte, 8)
+	scid = make([]byte, 8)
 	_, _ = rand.Read(dcid)
 	_, _ = rand.Read(scid)
 	hello, err := quicClientHello(ctx, sni, alpn, scid)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return sealQUICInitial(dcid, scid, 0, hello), nil
+	return sealQUICInitial(dcid, scid, 0, hello), scid, nil
 }
 
 func sealQUICInitial(dcid, scid []byte, pn uint32, crypto []byte) []byte {
@@ -178,8 +180,21 @@ func sealQUICInitial(dcid, scid []byte, pn uint32, crypto []byte) []byte {
 	return pkt
 }
 
-// quicReply: what came back is a QUIC long-header packet (Initial,
-// Handshake, Retry or Version Negotiation), not stray UDP.
-func quicReply(b []byte) bool {
+// quicLongHeader: a datagram that looks like QUIC from the outside.
+func quicLongHeader(b []byte) bool {
 	return len(b) >= 7 && b[0]&0x80 != 0
+}
+
+// quicReply: the server answered us — a long-header packet (Initial,
+// Handshake, Retry or Version Negotiation) of version 1 or 0 whose
+// destination connection ID is our scid. A middlebox that never parsed our
+// packet can't produce that; one that fakes "QUIC" with any long header can.
+func quicReply(b, scid []byte) bool {
+	if !quicLongHeader(b) || len(b) < 6+len(scid) {
+		return false
+	}
+	if v := binary.BigEndian.Uint32(b[1:5]); v != quicVersion1 && v != 0 {
+		return false
+	}
+	return int(b[5]) == len(scid) && bytes.Equal(b[6:6+len(scid)], scid)
 }

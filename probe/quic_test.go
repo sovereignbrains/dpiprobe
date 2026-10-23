@@ -85,17 +85,48 @@ func openQUICInitial(t *testing.T, pkt []byte) (pn uint32, payload []byte) {
 }
 
 func TestBuildQUICInitialCarriesSNI(t *testing.T) {
-	pkt, err := buildQUICInitial(context.Background(), "blocked.example", []string{"h3"})
+	pkt, scid, err := buildQUICInitial(context.Background(), "blocked.example", []string{"h3"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(pkt) < quicMinDatagram {
 		t.Fatalf("datagram %d bytes, servers drop under %d", len(pkt), quicMinDatagram)
 	}
-	if !quicReply(pkt) {
+	if !quicLongHeader(pkt) {
 		t.Fatal("not a long-header packet")
+	}
+	if !bytes.Equal(pkt[6+int(pkt[5])+1:][:len(scid)], scid) {
+		t.Fatal("scid returned is not the one in the packet")
 	}
 	if pn, payload := openQUICInitial(t, pkt); pn != 0 || payload[0] != 0x06 || !bytes.Contains(payload, []byte("blocked.example")) {
 		t.Fatalf("pn %d, frame %#x, SNI inside: %v", pn, payload[0], bytes.Contains(payload, []byte("blocked.example")))
+	}
+}
+
+func TestQUICReplyNeedsOurConnectionID(t *testing.T) {
+	scid := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	other := []byte{8, 7, 6, 5, 4, 3, 2, 1}
+	packet := func(first byte, version uint32, dcid []byte) []byte {
+		b := binary.BigEndian.AppendUint32([]byte{first}, version)
+		b = append(b, byte(len(dcid)))
+		b = append(b, dcid...)
+		return append(b, 0, 0x40, 0x10) // empty scid, a little body
+	}
+	cases := []struct {
+		name string
+		b    []byte
+		want bool
+	}{
+		{"server Initial", packet(0xc0, quicVersion1, scid), true},
+		{"version negotiation", packet(0x80, 0, scid), true},
+		{"someone else's id", packet(0xc0, quicVersion1, other), false},
+		{"unknown version", packet(0xc0, 0x6b3343cf, scid), false},
+		{"short header", packet(0x40, quicVersion1, scid), false},
+		{"truncated", packet(0xc0, quicVersion1, scid)[:9], false},
+	}
+	for _, c := range cases {
+		if got := quicReply(c.b, scid); got != c.want {
+			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
+		}
 	}
 }

@@ -410,7 +410,7 @@ func printQUIC(q probe.QUICReport) {
 	}
 }
 
-func printQUICSummary(q probe.QUICReport, vpnOn bool) {
+func printQUICSummary(q probe.QUICReport, tls []probe.TLSResult, vpnOn bool) {
 	if vpnOn && len(q.Sites) > 0 && (q.Control == "" || q.ControlName != "") {
 		fmt.Fprintln(out, "  • QUIC: VPN-клиенты часто сами отклоняют QUIC, чтобы браузер ушёл на TCP, — молчание ниже может быть их правилом.")
 	}
@@ -418,11 +418,21 @@ func printQUICSummary(q probe.QUICReport, vpnOn bool) {
 	if len(q.Sites) > 0 && q.Control == "" && !answered {
 		fmt.Fprintln(out, "  • QUIC за рубеж не проходит вообще: Hysteria2, TUIC и HTTP/3 работать не будут, нужен VPN поверх TCP (например, VLESS Reality).")
 	} else if len(q.Sites) > 0 {
-		ok, sni, toRU := 0, 0, 0
+		tlsDown := map[string]bool{}
+		for _, t := range tls {
+			tlsDown[t.Domain] = t.Status != "OK" && t.Status != "DNS FAIL"
+		}
+		ok, sni, toRU, fake := 0, 0, 0, 0
+		var onlyQUIC []string
 		for _, s := range q.Sites {
 			switch {
 			case s.Status == "OK":
 				ok++
+				if tlsDown[s.Domain] {
+					onlyQUIC = append(onlyQUIC, s.Domain)
+				}
+			case s.Status == "FAKE":
+				fake++
 			case strings.HasPrefix(s.Verdict, "DPI по SNI"), strings.HasPrefix(s.Verdict, "имя режется"):
 				sni++
 				if s.PassesToRU {
@@ -433,10 +443,17 @@ func printQUICSummary(q probe.QUICReport, vpnOn bool) {
 		fmt.Fprintf(out, "  • QUIC: отвечают %d из %d сайтов, режут по SNI: %d.", ok, len(q.Sites), sni)
 		if sni > 0 {
 			fmt.Fprint(out, " UDP-протоколы (Hysteria2, TUIC) проходят только с нейтральным SNI.")
-		} else {
-			fmt.Fprint(out, " UDP за рубеж открыт — Hysteria2 и TUIC должны работать.")
+		} else if ok > 0 {
+			fmt.Fprint(out, " UDP за рубеж проходит хотя бы к части адресов; свой сервер проверьте: -target адрес:порт.")
 		}
 		fmt.Fprintln(out)
+		if len(onlyQUIC) > 0 {
+			fmt.Fprintf(out, "  • По TLS закрыты, а по QUIC отвечают: %d (%s) — имя в QUIC здесь не проверяют.\n",
+				len(onlyQUIC), clip(strings.Join(onlyQUIC, ", "), 80))
+		}
+		if fake > 0 {
+			fmt.Fprintf(out, "  • QUIC подменяют: у %d сайтов ответил не сервер, а кто-то по пути.\n", fake)
+		}
 		if toRU > 0 {
 			fmt.Fprintf(out, "  • По QUIC к российскому адресу запрещённые имена проходят (%d из %d).\n", toRU, sni)
 		}
@@ -568,7 +585,7 @@ func printSummary(r report) {
 		}
 	}
 	if r.QUIC != nil {
-		printQUICSummary(*r.QUIC, r.Net != nil && len(r.Net.VPNIfaces) > 0)
+		printQUICSummary(*r.QUIC, r.TLS, r.Net != nil && len(r.Net.VPNIfaces) > 0)
 	}
 	if r.TCP16 != nil {
 		hit, ok := 0, 0
