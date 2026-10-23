@@ -25,13 +25,14 @@ type report struct {
 	Net      *probe.NetInfo        `json:"net,omitempty"`
 	DNS      *probe.DNSReport      `json:"dns,omitempty"`
 	TLS      []probe.TLSResult     `json:"tls,omitempty"`
+	QUIC     *probe.QUICReport     `json:"quic,omitempty"`
 	TCP16    []probe.TCP16Result   `json:"tcp16,omitempty"`
 	Telegram *probe.TelegramReport `json:"telegram,omitempty"`
 }
 
 func main() {
-	only := flag.String("only", "net,dns,tls,tcp16,tg", "какие проверки: net,dns,tls,tcp16,tg")
-	targets := flag.String("target", "", "свои серверы через запятую: host[:port][@sni] — только они проверяются на обрыв 16 КБ")
+	only := flag.String("only", "net,dns,tls,quic,tcp16,tg", "какие проверки: net,dns,tls,quic,tcp16,tg")
+	targets := flag.String("target", "", "свои серверы через запятую: host[:port][@sni] — только они проверяются на обрыв 16 КБ и ответ по UDP (QUIC)")
 	domains := flag.String("domains", "", "свои домены для TLS-проверки через запятую")
 	jsonOut := flag.String("json", "", "сохранить результаты в JSON-файл")
 	parallel := flag.Int("parallel", 8, "сколько проверок одновременно")
@@ -43,9 +44,22 @@ func main() {
 	flag.Visit(func(f *flag.Flag) { onlySet = onlySet || f.Name == "only" })
 	sections := strings.Split(*only, ",")
 	if *targets != "" && !onlySet {
-		sections = []string{"net", "tcp16"}
+		sections = []string{"net", "quic", "tcp16"}
 	}
 	has := func(s string) bool { return slices.Contains(sections, s) }
+	var own []probe.Target
+	for _, s := range splitList(*targets) {
+		t, err := probe.ParseTarget(s)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		own = append(own, t)
+	}
+	sites := probe.DefaultDomains()
+	if *domains != "" {
+		sites = splitList(*domains)
+	}
 
 	// A double-clicked console closes on exit, so the report always goes to
 	// files next to the exe as well.
@@ -89,26 +103,24 @@ func main() {
 		printDNS(d)
 	}
 	if has("tls") {
-		list := probe.DefaultDomains()
-		if *domains != "" {
-			list = splitList(*domains)
-		}
-		progress(fmt.Sprintf("TLS: %d доменов…", len(list)))
-		rep.TLS = p.CheckTLS(ctx, list)
+		progress(fmt.Sprintf("TLS: %d доменов…", len(sites)))
+		rep.TLS = p.CheckTLS(ctx, sites)
 		printTLS(rep.TLS)
 	}
+	if has("quic") {
+		// With own servers given, they alone are probed, as for tcp16.
+		list := sites
+		if len(own) > 0 {
+			list = nil
+		}
+		progress(fmt.Sprintf("QUIC (UDP 443): %d доменов, %d своих серверов…", len(list), len(own)))
+		q := p.CheckQUIC(ctx, list, own)
+		rep.QUIC = &q
+		printQUIC(q)
+	}
 	if has("tcp16") {
-		var list []probe.Target
-		if *targets != "" {
-			for _, s := range splitList(*targets) {
-				t, err := probe.ParseTarget(s)
-				if err != nil {
-					fmt.Fprintln(os.Stderr, err)
-					os.Exit(2)
-				}
-				list = append(list, t)
-			}
-		} else {
+		list := own
+		if len(list) == 0 {
 			var err error
 			if list, err = probe.DefaultTargets(); err != nil {
 				fmt.Fprintln(os.Stderr, err)
@@ -198,6 +210,10 @@ func printNet(ni probe.NetInfo) {
 	if len(ni.VPNIfaces) > 0 {
 		fmt.Fprintf(out, "  ВНИМАНИЕ: поднят VPN-интерфейс (%s) — проверяется путь через VPN, а не провайдер.\n", strings.Join(ni.VPNIfaces, ", "))
 		fmt.Fprintln(out, "  Для проверки провайдера выключите VPN.")
+	}
+	if len(ni.Bypass) > 0 {
+		fmt.Fprintf(out, "  ВНИМАНИЕ: запущен обход DPI — %s. Он переделывает пакеты самой проверки:\n", strings.Join(ni.Bypass, ", "))
+		fmt.Fprintln(out, "  сайты откроются, а провайдер окажется «чистым». Для проверки провайдера закройте его.")
 	}
 }
 
@@ -361,6 +377,75 @@ func printTLS(rs []probe.TLSResult) {
 	w.Flush()
 }
 
+func printQUIC(q probe.QUICReport) {
+	header("QUIC (UDP)")
+	if len(q.Sites) == 0 {
+		// Own servers only: no controls were probed.
+	} else if q.ControlName != "" {
+		fmt.Fprintf(out, "  Google, YouTube и Cloudflare по QUIC молчат; для сверки взят %s (%s).\n", q.ControlName, q.Control)
+	} else if q.Control != "" {
+		fmt.Fprintf(out, "  Зарубежный QUIC-сервер для сверки: %s, ответил за %s.\n", q.Control, ms(q.ControlRTT))
+	} else {
+		fmt.Fprintln(out, "  Нет зарубежного QUIC-сервера, который отвечает на любое имя: причину молчания сайтов не уточнить.")
+	}
+	if len(q.Sites) > 0 {
+		w := table()
+		fmt.Fprintln(w, "  Домен\tIP\tQUIC\tВывод")
+		for _, r := range q.Sites {
+			verdict := r.Verdict
+			if r.Status == "OK" && verdict == "" {
+				verdict = ms(r.RTT)
+			}
+			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", clip(r.Domain, 28), r.IP, r.Status, verdict)
+		}
+		w.Flush()
+	}
+	if len(q.Targets) > 0 {
+		fmt.Fprintln(out, "  Свои серверы по UDP:")
+		w := table()
+		for _, r := range q.Targets {
+			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", r.Domain, r.IP, r.Status, r.Verdict)
+		}
+		w.Flush()
+	}
+}
+
+func printQUICSummary(q probe.QUICReport, vpnOn bool) {
+	if vpnOn && len(q.Sites) > 0 && (q.Control == "" || q.ControlName != "") {
+		fmt.Fprintln(out, "  • QUIC: VPN-клиенты часто сами отклоняют QUIC, чтобы браузер ушёл на TCP, — молчание ниже может быть их правилом.")
+	}
+	answered := slices.ContainsFunc(q.Sites, func(s probe.QUICResult) bool { return s.Status == "OK" })
+	if len(q.Sites) > 0 && q.Control == "" && !answered {
+		fmt.Fprintln(out, "  • QUIC за рубеж не проходит вообще: Hysteria2, TUIC и HTTP/3 работать не будут, нужен VPN поверх TCP (например, VLESS Reality).")
+	} else if len(q.Sites) > 0 {
+		ok, sni, toRU := 0, 0, 0
+		for _, s := range q.Sites {
+			switch {
+			case s.Status == "OK":
+				ok++
+			case strings.HasPrefix(s.Verdict, "DPI по SNI"), strings.HasPrefix(s.Verdict, "имя режется"):
+				sni++
+				if s.PassesToRU {
+					toRU++
+				}
+			}
+		}
+		fmt.Fprintf(out, "  • QUIC: отвечают %d из %d сайтов, режут по SNI: %d.", ok, len(q.Sites), sni)
+		if sni > 0 {
+			fmt.Fprint(out, " UDP-протоколы (Hysteria2, TUIC) проходят только с нейтральным SNI.")
+		} else {
+			fmt.Fprint(out, " UDP за рубеж открыт — Hysteria2 и TUIC должны работать.")
+		}
+		fmt.Fprintln(out)
+		if toRU > 0 {
+			fmt.Fprintf(out, "  • По QUIC к российскому адресу запрещённые имена проходят (%d из %d).\n", toRU, sni)
+		}
+	}
+	for _, t := range q.Targets {
+		fmt.Fprintf(out, "  • %s по UDP: %s.\n", t.Domain, t.Verdict)
+	}
+}
+
 func printTCP16(rs []probe.TCP16Result) {
 	header("Обрыв после 16–20 КБ")
 	w := table()
@@ -409,6 +494,9 @@ func printSummary(r report) {
 	header("Итог")
 	if r.Net != nil && len(r.Net.VPNIfaces) > 0 {
 		fmt.Fprintln(out, "  • Включён VPN — выводы ниже про путь через VPN, а не про провайдера.")
+	}
+	if r.Net != nil && len(r.Net.Bypass) > 0 {
+		fmt.Fprintln(out, "  • Работает обход DPI — выводы ниже про провайдера вместе с ним, а не про провайдера.")
 	}
 	if r.DNS != nil {
 		var hijacked, spoofed []string
@@ -478,6 +566,9 @@ func printSummary(r report) {
 			fmt.Fprintf(out, "  • К российскому адресу (ya.ru) запрещённые имена проходят (%d из %d): похоже, SNI проверяют только в трафике за рубеж.\n",
 				count["toRU"], blocked)
 		}
+	}
+	if r.QUIC != nil {
+		printQUICSummary(*r.QUIC, r.Net != nil && len(r.Net.VPNIfaces) > 0)
 	}
 	if r.TCP16 != nil {
 		hit, ok := 0, 0

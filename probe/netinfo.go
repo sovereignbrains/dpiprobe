@@ -14,6 +14,7 @@ type NetInfo struct {
 	AS        ASInfo
 	Err       string
 	VPNIfaces []string
+	Bypass    []string // running DPI bypass tools, see RunningBypass
 }
 
 // Anchored: Windows has "Teredo Tunneling Pseudo-Interface", which is not a VPN.
@@ -28,6 +29,7 @@ func (p *Prober) NetInfo(ctx context.Context) NetInfo {
 			}
 		}
 	}
+	ni.Bypass = RunningBypass()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.ipify.org", nil)
 	if err != nil {
 		ni.Err = shortErr(err)
