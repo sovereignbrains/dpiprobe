@@ -23,7 +23,14 @@ var quicV1Salt = []byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x
 const (
 	quicVersion1    = 0x00000001
 	quicMinDatagram = 1200
+	quicFatDatagram = 1400
 	quicPNLen       = 4
+)
+
+const (
+	quicPacketStd = iota
+	quicPacketGrease
+	quicPacketFat
 )
 
 type quicKeys struct{ key, iv, hp []byte }
@@ -70,7 +77,9 @@ func appendVarint(b []byte, v uint64) []byte {
 }
 
 // quicTransportParams: the minimum a server accepts before it answers.
-func quicTransportParams(scid []byte) []byte {
+// grease adds max_ack_delay and a grease parameter, which is what a browser
+// sends and what a picky server may require.
+func quicTransportParams(scid []byte, grease bool) []byte {
 	var b []byte
 	param := func(id uint64, val []byte) {
 		b = appendVarint(b, id)
@@ -87,11 +96,15 @@ func quicTransportParams(scid []byte) []byte {
 	num(0x08, 100)    // initial_max_streams_bidi
 	num(0x09, 100)    // initial_max_streams_uni
 	param(0x0f, scid) // initial_source_connection_id
+	if grease {
+		num(0x0b, 25)             // max_ack_delay, ms
+		param(27+31*2, []byte{0}) // grease, RFC 9000
+	}
 	return b
 }
 
 // quicClientHello asks crypto/tls for the ClientHello a QUIC client sends.
-func quicClientHello(ctx context.Context, sni string, alpn []string, scid []byte) ([]byte, error) {
+func quicClientHello(ctx context.Context, sni string, alpn []string, scid []byte, grease bool) ([]byte, error) {
 	q := tls.QUICClient(&tls.QUICConfig{TLSConfig: &tls.Config{
 		ServerName:         sni,
 		NextProtos:         alpn,
@@ -99,7 +112,7 @@ func quicClientHello(ctx context.Context, sni string, alpn []string, scid []byte
 		InsecureSkipVerify: true, //nolint:gosec // the handshake is never finished
 	}})
 	defer q.Close()
-	q.SetTransportParameters(quicTransportParams(scid))
+	q.SetTransportParameters(quicTransportParams(scid, grease))
 	if err := q.Start(ctx); err != nil {
 		return nil, err
 	}
@@ -124,18 +137,35 @@ func quicClientHello(ctx context.Context, sni string, alpn []string, scid []byte
 // RFC 9000 requires of a client — servers drop shorter ones.
 // The source connection ID comes back too: every server reply carries it.
 func buildQUICInitial(ctx context.Context, sni string, alpn []string) (pkt, scid []byte, err error) {
+	return buildQUICInitialKind(ctx, sni, alpn, quicPacketStd)
+}
+
+// buildQUICInitialKind: std is the usual 1200-byte Initial, grease adds the
+// transport parameters a browser sends, fat pads to 1400 bytes.
+func buildQUICInitialKind(ctx context.Context, sni string, alpn []string, kind int) (pkt, scid []byte, err error) {
 	dcid := make([]byte, 8)
 	scid = make([]byte, 8)
 	_, _ = rand.Read(dcid)
 	_, _ = rand.Read(scid)
-	hello, err := quicClientHello(ctx, sni, alpn, scid)
+	hello, err := quicClientHello(ctx, sni, alpn, scid, kind == quicPacketGrease)
 	if err != nil {
 		return nil, nil, err
 	}
-	return sealQUICInitial(dcid, scid, 0, hello), scid, nil
+	size := quicMinDatagram
+	if kind == quicPacketFat {
+		size = quicFatDatagram
+	}
+	return sealQUICInitialN(dcid, scid, 0, hello, size), scid, nil
 }
 
 func sealQUICInitial(dcid, scid []byte, pn uint32, crypto []byte) []byte {
+	return sealQUICInitialN(dcid, scid, pn, crypto, quicMinDatagram)
+}
+
+func sealQUICInitialN(dcid, scid []byte, pn uint32, crypto []byte, size int) []byte {
+	if size < quicMinDatagram {
+		size = quicMinDatagram
+	}
 	frames := []byte{0x06} // CRYPTO
 	frames = appendVarint(frames, 0)
 	frames = appendVarint(frames, uint64(len(crypto)))
@@ -152,7 +182,7 @@ func sealQUICInitial(dcid, scid []byte, pn uint32, crypto []byte) []byte {
 	// Length is a two-byte varint: header size stays fixed while padding
 	// is worked out.
 	const tag = 16
-	if room := quicMinDatagram - (len(hdr) + 2 + quicPNLen + len(frames) + tag); room > 0 {
+	if room := size - (len(hdr) + 2 + quicPNLen + len(frames) + tag); room > 0 {
 		frames = append(frames, make([]byte, room)...) // PADDING frames are zeros
 	}
 	hdr = binary.BigEndian.AppendUint16(hdr, uint16(quicPNLen+len(frames)+tag)|0x4000)

@@ -96,11 +96,14 @@ func (p *Prober) CheckDNS(ctx context.Context) DNSReport {
 	truth := map[string]*domainTruth{}
 	var mu sync.Mutex
 	rep.Truth = make([]TruthStatus, len(truthServers))
+	p.tick("DNS", 0, 3)
 	p.forEach(len(truthServers), func(i int) {
 		s := truthServers[i]
 		st := TruthStatus{Name: s.Name}
 		for _, d := range dnsForbidden {
-			a, rtt, err := p.DoH(ctx, s.URL, d, typeA)
+			qctx, cancel := p.quick(ctx)
+			a, rtt, err := p.DoH(qctx, s.URL, d, typeA)
+			cancel()
 			if err != nil {
 				if st.Err == "" {
 					st.Err = statusFor(stageTLS, err) + ": " + shortErr(err)
@@ -141,6 +144,7 @@ func (p *Prober) CheckDNS(ctx context.Context) DNSReport {
 			}
 		}
 	}
+	p.tick("DNS", 1, 3)
 
 	rep.Servers = make([]DNSServerResult, len(udpResolvers)+1)
 	p.forEach(len(rep.Servers), func(i int) {
@@ -150,7 +154,9 @@ func (p *Prober) CheckDNS(ctx context.Context) DNSReport {
 		}
 		rep.Servers[i] = p.checkUDPResolver(ctx, i, truth)
 	})
+	p.tick("DNS", 2, 3)
 	rep.Encrypted = p.checkEncrypted(ctx, truth)
+	p.tick("DNS", 3, 3)
 	return rep
 }
 

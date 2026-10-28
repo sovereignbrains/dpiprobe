@@ -32,9 +32,10 @@ type Prober struct {
 	Timeout  time.Duration
 	Parallel int
 	// Progress, if set, is called from several goroutines as long checks advance.
-	Progress func(done, total int)
+	Progress func(label string, done, total int)
 
 	http *http.Client
+	sem  chan struct{}
 
 	mu    sync.Mutex
 	hosts map[string][]net.IP
@@ -49,6 +50,7 @@ func New(timeout time.Duration, parallel int) *Prober {
 		hosts:    map[string][]net.IP{},
 		asns:     map[string]ASInfo{},
 		names:    map[int]string{},
+		sem:      make(chan struct{}, max(parallel, 1)),
 	}
 	p.http = &http.Client{
 		Transport: &http.Transport{
@@ -65,29 +67,94 @@ func New(timeout time.Duration, parallel int) *Prober {
 
 func (p *Prober) dnsTimeout() time.Duration { return min(p.Timeout, 5*time.Second) }
 
-// forEach runs fn for every index with at most p.Parallel at a time.
+// quick bounds one exchange that is allowed to fail fast: a dead resolver
+// must not burn the whole probe timeout.
+func (p *Prober) quick(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, min(p.Timeout, 3*time.Second))
+}
+
+func (p *Prober) tick(label string, done, total int) {
+	if p.Progress != nil && total > 0 {
+		p.Progress(label, done, total)
+	}
+}
+
+// silenceWindow is how long to wait when silence itself is the answer:
+// a QUIC Initial with no reply, or an HTTP response that never starts.
+// A TLS handshake waits the full Timeout. DPI can sit on it for seconds
+// and still complete, and cutting that short hides a later freeze.
+func (p *Prober) silenceWindow(rtt time.Duration) time.Duration {
+	if rtt <= 0 {
+		rtt = 50 * time.Millisecond
+	}
+	w := max(8*rtt, 400*time.Millisecond)
+	if w > 1500*time.Millisecond {
+		w = 1500 * time.Millisecond
+	}
+	if p.Timeout > 0 && w > p.Timeout {
+		w = p.Timeout
+	}
+	return w
+}
+
+// silenceConn extends the deadline to the full probe timeout on the first
+// byte. Until then the short deadline stands: no byte means a drop.
+type silenceConn struct {
+	net.Conn
+	full time.Duration
+	once sync.Once
+}
+
+func (c *silenceConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.once.Do(func() { _ = c.Conn.SetDeadline(time.Now().Add(c.full)) })
+	}
+	return n, err
+}
+
+// armSilence arms c with silenceWindow(rtt). The returned conn is what
+// reads must go through so the first byte can extend the deadline.
+func (p *Prober) armSilence(c net.Conn, rtt time.Duration) net.Conn {
+	_ = c.SetDeadline(time.Now().Add(p.silenceWindow(rtt)))
+	full := p.Timeout
+	if full <= 0 {
+		full = 8 * time.Second
+	}
+	return &silenceConn{Conn: c, full: full}
+}
+
+// handshakeWait is the full probe timeout. TLS handshakes use it directly:
+// a short silence window turns a delayed ServerHello into TLS DROP.
+func (p *Prober) handshakeWait() time.Duration {
+	if p.Timeout > 0 {
+		return p.Timeout
+	}
+	return 8 * time.Second
+}
+
+// forEach runs fn for every index. Every section shares one semaphore, so
+// overlapping sections cannot open Parallel connections each.
+// fn must not call forEach: the slot is held until fn returns.
 func (p *Prober) forEach(n int, fn func(i int)) {
-	sem := make(chan struct{}, p.Parallel)
 	var wg sync.WaitGroup
 	for i := range n {
 		wg.Add(1)
-		sem <- struct{}{}
+		p.sem <- struct{}{}
 		go func() {
-			defer func() { <-sem; wg.Done() }()
+			defer func() { <-p.sem; wg.Done() }()
 			fn(i)
 		}()
 	}
 	wg.Wait()
 }
 
-// forEachCounted is forEach that reports progress.
-func (p *Prober) forEachCounted(n int, fn func(i int)) {
+// forEachCounted is forEach that reports progress under label.
+func (p *Prober) forEachCounted(label string, n int, fn func(i int)) {
 	var done atomic.Int64
 	p.forEach(n, func(i int) {
 		fn(i)
-		if p.Progress != nil {
-			p.Progress(int(done.Add(1)), n)
-		}
+		p.tick(label, int(done.Add(1)), n)
 	})
 }
 

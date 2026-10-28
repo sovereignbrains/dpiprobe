@@ -54,10 +54,12 @@ func (p *Prober) checkEncrypted(ctx context.Context, truth map[string]*domainTru
 		s := encServers[i]
 		r := EncResult{Name: s.Name, Kind: s.Kind, Addr: s.Addr}
 		query := func(name string) (dnsAnswer, time.Duration, error) {
+			qctx, cancel := p.quick(ctx)
+			defer cancel()
 			if s.Kind == "DoT" {
-				return p.DoT(ctx, s.Addr, name, typeA)
+				return p.DoT(qctx, s.Addr, name, typeA)
 			}
-			return p.DoH(ctx, s.Addr, name, typeA)
+			return p.DoH(qctx, s.Addr, name, typeA)
 		}
 		a, rtt, err := query(dnsControl)
 		if err != nil {
@@ -103,13 +105,19 @@ func (p *Prober) DoT(ctx context.Context, addr, name string, qtype uint16) (dnsA
 		ip = ips[0].String()
 	}
 	t0 := time.Now()
-	d := tls.Dialer{NetDialer: &net.Dialer{Timeout: p.Timeout}, Config: &tls.Config{ServerName: addr}}
+	dialTimeout := p.Timeout
+	if dl, ok := ctx.Deadline(); ok {
+		if left := time.Until(dl); left > 0 && left < dialTimeout {
+			dialTimeout = left
+		}
+	}
+	d := tls.Dialer{NetDialer: &net.Dialer{Timeout: dialTimeout}, Config: &tls.Config{ServerName: addr}}
 	conn, err := d.DialContext(ctx, "tcp4", net.JoinHostPort(ip, "853"))
 	if err != nil {
 		return dnsAnswer{}, 0, err
 	}
 	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(p.Timeout))
+	_ = conn.SetDeadline(time.Now().Add(dialTimeout))
 	q := buildQuery(name, qtype)
 	if _, err := conn.Write(append(binary.BigEndian.AppendUint16(nil, uint16(len(q))), q...)); err != nil {
 		return dnsAnswer{}, 0, err

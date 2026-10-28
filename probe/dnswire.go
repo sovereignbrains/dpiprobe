@@ -9,10 +9,13 @@ import (
 )
 
 const (
-	typeA   = 1
-	typeTXT = 16
+	typeA     = 1
+	typeTXT   = 16
+	typeHTTPS = 65
 
 	rcodeNXDomain = 3
+
+	svcParamECH = 5
 )
 
 var errDNSFormat = errors.New("битый DNS-ответ")
@@ -21,6 +24,7 @@ type dnsAnswer struct {
 	rcode int
 	ips   []net.IP
 	txt   []string
+	ech   []byte // ECHConfigList from an HTTPS record
 }
 
 func buildQuery(name string, qtype uint16) []byte {
@@ -80,10 +84,40 @@ func parseResponse(msg, query []byte) (dnsAnswer, error) {
 				j += 1 + n
 			}
 			a.txt = append(a.txt, sb.String())
+		case typ == typeHTTPS && len(a.ech) == 0:
+			if ech := echFromHTTPS(msg, off, off+rdlen); len(ech) > 0 {
+				a.ech = ech
+			}
 		}
 		off += rdlen
 	}
 	return a, nil
+}
+
+// echFromHTTPS pulls the ech SvcParam (key 5) out of an HTTPS rdata.
+// The value is the ECHConfigList crypto/tls expects, length prefix included.
+func echFromHTTPS(msg []byte, off, end int) []byte {
+	if off+2 > end {
+		return nil
+	}
+	off += 2 // priority
+	var err error
+	if off, err = skipName(msg, off); err != nil || off > end {
+		return nil
+	}
+	for off+4 <= end {
+		key := binary.BigEndian.Uint16(msg[off:])
+		ln := int(binary.BigEndian.Uint16(msg[off+2:]))
+		off += 4
+		if ln < 0 || off+ln > end {
+			return nil
+		}
+		if key == svcParamECH && ln > 0 {
+			return append([]byte(nil), msg[off:off+ln]...)
+		}
+		off += ln
+	}
+	return nil
 }
 
 func skipName(msg []byte, off int) (int, error) {

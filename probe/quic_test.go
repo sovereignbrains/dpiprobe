@@ -7,7 +7,9 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"encoding/hex"
+	"net"
 	"testing"
+	"time"
 )
 
 func unhex(t *testing.T, s string) []byte {
@@ -100,6 +102,102 @@ func TestBuildQUICInitialCarriesSNI(t *testing.T) {
 	}
 	if pn, payload := openQUICInitial(t, pkt); pn != 0 || payload[0] != 0x06 || !bytes.Contains(payload, []byte("blocked.example")) {
 		t.Fatalf("pn %d, frame %#x, SNI inside: %v", pn, payload[0], bytes.Contains(payload, []byte("blocked.example")))
+	}
+}
+
+func TestGreaseAndFatInitials(t *testing.T) {
+	std, _, err := buildQUICInitialKind(context.Background(), "blocked.example", []string{"h3"}, quicPacketStd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grease, _, err := buildQUICInitialKind(context.Background(), "blocked.example", []string{"h3"}, quicPacketGrease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fat, _, err := buildQUICInitialKind(context.Background(), "blocked.example", []string{"h3"}, quicPacketFat)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(std) < quicMinDatagram || len(grease) < quicMinDatagram {
+		t.Fatalf("short datagrams %d %d", len(std), len(grease))
+	}
+	if len(fat) < quicFatDatagram {
+		t.Fatalf("fat datagram %d, want at least %d", len(fat), quicFatDatagram)
+	}
+	for _, pkt := range [][]byte{grease, fat} {
+		if _, payload := openQUICInitial(t, pkt); !bytes.Contains(payload, []byte("blocked.example")) {
+			t.Fatal("SNI missing")
+		}
+	}
+}
+
+func scidOf(pkt []byte) []byte {
+	if len(pkt) < 7 || pkt[0]&0x80 == 0 {
+		return nil
+	}
+	off := 6 + int(pkt[5])
+	if off >= len(pkt) {
+		return nil
+	}
+	n := int(pkt[off])
+	off++
+	if n <= 0 || off+n > len(pkt) {
+		return nil
+	}
+	return append([]byte(nil), pkt[off:off+n]...)
+}
+
+func TestQUICBurstMatchesReplies(t *testing.T) {
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 2048)
+		_ = pc.SetReadDeadline(time.Now().Add(3 * time.Second))
+		for {
+			n, addr, err := pc.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			id := scidOf(buf[:n])
+			if id == nil {
+				continue
+			}
+			reply := append([]byte{0xc0, 0, 0, 0, 1, byte(len(id))}, id...)
+			_, _ = pc.WriteToUDP(reply, addr)
+		}
+	}()
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	p := New(time.Second, 2)
+	hits, _ := p.quicBurst(context.Background(), []quicShot{
+		{ip: "127.0.0.1", port: port, sni: "a.example"},
+		{ip: "127.0.0.1", port: port, sni: "b.example"},
+	}, 20*time.Millisecond, false)
+	pc.Close()
+	<-done
+	for i, h := range hits {
+		if h.status != "OK" {
+			t.Fatalf("shot %d: %+v", i, h)
+		}
+	}
+}
+
+func TestQUICBurstSilence(t *testing.T) {
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	p := New(time.Second, 1)
+	hits, _ := p.quicBurst(context.Background(), []quicShot{
+		{ip: "127.0.0.1", port: pc.LocalAddr().(*net.UDPAddr).Port, sni: "a.example"},
+	}, 10*time.Millisecond, false)
+	if hits[0].status != "NO REPLY" {
+		t.Fatalf("got %+v", hits[0])
 	}
 }
 

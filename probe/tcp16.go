@@ -97,7 +97,10 @@ func (p *Prober) dialFat(ctx context.Context, ip string, port int, sni string) (
 	cc := &countConn{Conn: raw}
 	var conn net.Conn = cc
 	if port != 80 {
-		_ = raw.SetDeadline(time.Now().Add(p.Timeout))
+		if tcp, ok := raw.(*net.TCPConn); ok {
+			_ = tcp.SetNoDelay(true)
+		}
+		_ = raw.SetDeadline(time.Now().Add(p.handshakeWait()))
 		tc := tls.Client(cc, &tls.Config{ServerName: sni, InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}}) //nolint:gosec // probe, not a client
 		if err := tc.HandshakeContext(ctx); err != nil {
 			raw.Close()
@@ -225,29 +228,15 @@ func (p *Prober) confirm(first FatResult, probe func() FatResult) (FatResult, bo
 	return first, false
 }
 
-func (p *Prober) CheckTarget(ctx context.Context, t Target) TCP16Result {
-	r := TCP16Result{Target: t}
-	ip := t.IP
-	if net.ParseIP(ip) == nil {
-		ips, err := p.LookupHost(ctx, ip)
-		if err != nil {
-			r.Up = FatResult{Status: "DNS FAIL", Detail: shortErr(err)}
-			r.Verdict = "DNS FAIL"
-			return r
-		}
-		ip = ips[0].String()
+func reachableStatus(s string) bool {
+	switch s {
+	case "OK", "DETECTED", "FLAKY", "CLOSED", "STALL":
+		return true
 	}
-	sni := t.SNI
-	if sni == "" && t.Port != 80 {
-		sni = defaultSNI
-	}
-	var upHit, downHit bool
-	r.Up, upHit = p.confirm(p.fatUp(ctx, ip, t.Port, sni), func() FatResult { return p.fatUp(ctx, ip, t.Port, sni) })
-	reachable := r.Up.Status == "OK" || r.Up.Status == "DETECTED" || r.Up.Status == "FLAKY" || r.Up.Status == "CLOSED" || r.Up.Status == "STALL"
-	// A confirmed freeze on the way up already answers the question.
-	if reachable && !upHit {
-		r.Down, downHit = p.confirm(p.fatDown(ctx, ip, t.Port, sni), func() FatResult { return p.fatDown(ctx, ip, t.Port, sni) })
-	}
+	return false
+}
+
+func applyVerdict(r *TCP16Result, upHit, downHit bool) {
 	switch {
 	case upHit || downHit:
 		r.Verdict = "DETECTED"
@@ -260,12 +249,108 @@ func (p *Prober) CheckTarget(ctx context.Context, t Target) TCP16Result {
 	default:
 		r.Verdict = r.Up.Status
 	}
+}
+
+func (p *Prober) endpoint(ctx context.Context, t Target) (ip string, port int, sni string, err error) {
+	ip = t.IP
+	if net.ParseIP(ip) == nil {
+		ips, e := p.LookupHost(ctx, ip)
+		if e != nil {
+			return "", 0, "", e
+		}
+		ip = ips[0].String()
+	}
+	sni = t.SNI
+	if sni == "" && t.Port != 80 {
+		sni = defaultSNI
+	}
+	return ip, t.Port, sni, nil
+}
+
+// measureTarget probes once in each direction. A freeze on the way up is
+// not confirmed here: CheckTCP16 confirms one address per network.
+func (p *Prober) measureTarget(ctx context.Context, t Target) TCP16Result {
+	r := TCP16Result{Target: t}
+	ip, port, sni, err := p.endpoint(ctx, t)
+	if err != nil {
+		r.Up = FatResult{Status: "DNS FAIL", Detail: shortErr(err)}
+		r.Verdict = "DNS FAIL"
+		return r
+	}
+	r.Up = p.fatUp(ctx, ip, port, sni)
+	if reachableStatus(r.Up.Status) && r.Up.Status != "DETECTED" {
+		r.Down = p.fatDown(ctx, ip, port, sni)
+		if r.Down.Status == "DETECTED" {
+			var hit bool
+			r.Down, hit = p.confirm(r.Down, func() FatResult { return p.fatDown(ctx, ip, port, sni) })
+			applyVerdict(&r, false, hit)
+			return r
+		}
+	}
+	applyVerdict(&r, r.Up.Status == "DETECTED", false)
 	return r
+}
+
+// confirmUp repeats a freeze on the way up. One stall is not proof.
+func (p *Prober) confirmUp(ctx context.Context, r TCP16Result) TCP16Result {
+	if r.Up.Status != "DETECTED" {
+		return r
+	}
+	ip, port, sni, err := p.endpoint(ctx, r.Target)
+	if err != nil {
+		return r
+	}
+	up, hit := p.confirm(r.Up, func() FatResult { return p.fatUp(ctx, ip, port, sni) })
+	r.Up = up
+	if hit {
+		r.Verdict = "DETECTED"
+		return r
+	}
+	var downHit bool
+	if reachableStatus(r.Up.Status) {
+		r.Down, downHit = p.confirm(p.fatDown(ctx, ip, port, sni), func() FatResult { return p.fatDown(ctx, ip, port, sni) })
+	}
+	applyVerdict(&r, false, downHit)
+	return r
+}
+
+func (p *Prober) CheckTarget(ctx context.Context, t Target) TCP16Result {
+	return p.confirmUp(ctx, p.measureTarget(ctx, t))
 }
 
 func (p *Prober) CheckTCP16(ctx context.Context, targets []Target, whitelist []string) []TCP16Result {
 	out := make([]TCP16Result, len(targets))
-	p.forEachCounted(len(targets), func(i int) { out[i] = p.CheckTarget(ctx, targets[i]) })
+	p.forEachCounted("16 КБ", len(targets), func(i int) { out[i] = p.measureTarget(ctx, targets[i]) })
+	groups := map[string][]int{}
+	var order []string
+	for i, r := range out {
+		if r.Up.Status != "DETECTED" {
+			continue
+		}
+		key := r.Target.ASN
+		if key == "" {
+			key = r.Target.ID
+		}
+		if key == "" {
+			key = r.Target.IP
+		}
+		if _, ok := groups[key]; !ok {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], i)
+	}
+	var retry []int
+	var mu sync.Mutex
+	p.forEach(len(order), func(j int) {
+		g := groups[order[j]]
+		out[g[0]] = p.confirmUp(ctx, out[g[0]])
+		if out[g[0]].Verdict != "DETECTED" {
+			mu.Lock()
+			retry = append(retry, g[1:]...)
+			mu.Unlock()
+		}
+	})
+	p.forEach(len(retry), func(j int) { out[retry[j]] = p.confirmUp(ctx, out[retry[j]]) })
 	if len(whitelist) == 0 {
 		return out
 	}
@@ -283,7 +368,7 @@ func (p *Prober) CheckTCP16(ctx context.Context, targets []Target, whitelist []s
 			reps = append(reps, i)
 		}
 	}
-	p.forEach(len(reps), func(j int) {
+	p.forEachCounted("SNI", len(reps), func(j int) {
 		i := reps[j]
 		out[i].WhiteSNI = p.findWhiteSNI(ctx, out[i].Target, whitelist)
 	})

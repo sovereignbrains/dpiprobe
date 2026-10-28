@@ -3,7 +3,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -25,6 +24,7 @@ type report struct {
 	Net      *probe.NetInfo        `json:"net,omitempty"`
 	DNS      *probe.DNSReport      `json:"dns,omitempty"`
 	TLS      []probe.TLSResult     `json:"tls,omitempty"`
+	Bypass   *probe.BypassReport   `json:"bypass,omitempty"`
 	QUIC     *probe.QUICReport     `json:"quic,omitempty"`
 	TCP16    []probe.TCP16Result   `json:"tcp16,omitempty"`
 	Telegram *probe.TelegramReport `json:"telegram,omitempty"`
@@ -38,6 +38,7 @@ func main() {
 	parallel := flag.Int("parallel", 8, "сколько проверок одновременно")
 	timeout := flag.Duration("timeout", 8*time.Second, "таймаут одной пробы")
 	sniSearch := flag.Bool("sni", true, "искать белые SNI для сетей с обрывом")
+	noupdate := flag.Bool("noupdate", false, "не проверять GitHub на новую версию")
 	flag.Parse()
 
 	onlySet := false
@@ -61,62 +62,104 @@ func main() {
 		sites = splitList(*domains)
 	}
 
-	// A double-clicked console closes on exit, so the report always goes to
-	// files next to the exe as well.
+	clicked := ownConsole()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	cleanupOldBinary()
+	order := []string{"Обновление", "DNS", "Сайты", "Обход", "QUIC", "16 КБ", "SNI", "TG"}
+	if !has("dns") {
+		order = drop(order, "DNS")
+	}
+	if !has("tls") {
+		order = drop(order, "Сайты", "Обход")
+	}
+	if !has("quic") {
+		order = drop(order, "QUIC")
+	}
+	if !has("tcp16") {
+		order = drop(order, "16 КБ", "SNI")
+	}
+	if !has("tg") {
+		order = drop(order, "TG")
+	}
+	live := newLive(os.Stderr, enableVT(), order)
+	setTitle("dpiprobe " + version + " — проверка")
+	if clicked {
+		fmt.Fprintln(os.Stderr, "Проверка провайдера. Окно закроется само, отчёт ляжет рядом с программой.")
+	} else {
+		fmt.Fprintln(os.Stderr, "Проверка провайдера. Отчёт пишется в файл.")
+	}
+	fmt.Fprintln(os.Stderr)
+	live.show()
+	if *noupdate {
+		live.note("Обновление", "—")
+	} else {
+		maybeUpdate(ctx, live)
+	}
+
+	// The report always goes to files next to the exe. A double-clicked
+	// window shows only the short status and closes itself when the files
+	// are written; a terminal still gets the full text. Created after the
+	// updater so a restart does not leave an empty report.
 	base := reportBase()
+	var reportFile *os.File
 	if f, err := os.Create(base + ".txt"); err == nil {
+		reportFile = f
 		defer f.Close()
-		out = io.MultiWriter(os.Stdout, f)
+		out = f
+		if !clicked {
+			out = io.MultiWriter(os.Stdout, f)
+		}
 	} else {
 		fmt.Fprintln(os.Stderr, "Не удалось создать файл отчёта:", err)
 	}
 	if *jsonOut == "" {
 		*jsonOut = base + ".json"
 	}
-	defer waitIfOwnConsole()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
 	p := probe.New(*timeout, *parallel)
-	var progressMu sync.Mutex
-	p.Progress = func(done, total int) {
-		progressMu.Lock()
-		defer progressMu.Unlock()
-		fmt.Fprintf(os.Stderr, "\r   %d/%d", done, total)
-		if done == total {
-			fmt.Fprintln(os.Stderr)
-		}
-	}
+	p.Progress = live.set
 	var rep report
 	start := time.Now()
-	progress("Проверка займёт 3–6 минут. Окно не закрывайте — отчёт сохранится сам.")
 
+	var wg sync.WaitGroup
+	run := func(fn func()) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fn()
+		}()
+	}
 	if has("net") {
-		ni := p.NetInfo(ctx)
-		rep.Net = &ni
-		printNet(ni)
+		run(func() {
+			ni := p.NetInfo(ctx)
+			rep.Net = &ni
+		})
 	}
 	if has("dns") {
-		progress("DNS: эталон через DoH и опрос резолверов…")
-		d := p.CheckDNS(ctx)
-		rep.DNS = &d
-		printDNS(d)
+		run(func() {
+			d := p.CheckDNS(ctx)
+			rep.DNS = &d
+		})
 	}
 	if has("tls") {
-		progress(fmt.Sprintf("TLS: %d доменов…", len(sites)))
-		rep.TLS = p.CheckTLS(ctx, sites)
-		printTLS(rep.TLS)
+		run(func() {
+			rep.TLS = p.CheckTLS(ctx, sites)
+			if b := p.CheckBypass(ctx, rep.TLS); b.Domain != "" {
+				rep.Bypass = &b
+			}
+		})
 	}
 	if has("quic") {
-		// With own servers given, they alone are probed, as for tcp16.
 		list := sites
 		if len(own) > 0 {
 			list = nil
 		}
-		progress(fmt.Sprintf("QUIC (UDP 443): %d доменов, %d своих серверов…", len(list), len(own)))
-		q := p.CheckQUIC(ctx, list, own)
-		rep.QUIC = &q
-		printQUIC(q)
+		run(func() {
+			q := p.CheckQUIC(ctx, list, own)
+			rep.QUIC = &q
+		})
 	}
 	if has("tcp16") {
 		list := own
@@ -131,25 +174,59 @@ func main() {
 		if *sniSearch {
 			white = probe.WhitelistSNI()
 		}
-		progress(fmt.Sprintf("Обрыв 16–20 КБ: %d целей, вверх и вниз…", len(list)))
-		rep.TCP16 = p.CheckTCP16(ctx, list, white)
-		printTCP16(rep.TCP16)
+		run(func() {
+			rep.TCP16 = p.CheckTCP16(ctx, list, white)
+		})
 	}
 	if has("tg") {
-		progress("Telegram: MTProto к дата-центрам и загрузка с telegram.org…")
-		tg := p.CheckTelegram(ctx)
-		rep.Telegram = &tg
-		printTelegram(tg)
+		run(func() {
+			tg := p.CheckTelegram(ctx)
+			rep.Telegram = &tg
+		})
+	}
+	wg.Wait()
+	live.settle()
+
+	if rep.Net != nil {
+		printNet(*rep.Net)
+	}
+	if rep.DNS != nil {
+		printDNS(*rep.DNS)
+	}
+	if rep.TLS != nil {
+		printTLS(rep.TLS)
+		if rep.Bypass != nil {
+			printBypass(*rep.Bypass)
+		}
+	}
+	if rep.QUIC != nil {
+		printQUIC(*rep.QUIC)
+	}
+	if rep.TCP16 != nil {
+		printTCP16(rep.TCP16)
+	}
+	if rep.Telegram != nil {
+		printTelegram(*rep.Telegram)
 	}
 	printSummary(rep)
-	fmt.Fprintf(out, "\nГотово за %s.\n", time.Since(start).Round(time.Second))
+	fmt.Fprintf(out, "\nГотово за %s. dpiprobe %s.\n", time.Since(start).Round(time.Second), version)
 
 	b, _ := json.MarshalIndent(rep, "", "  ")
 	if err := os.WriteFile(*jsonOut, b, 0o644); err != nil {
 		fmt.Fprintln(os.Stderr, "JSON:", err)
+		if clicked {
+			time.Sleep(4 * time.Second)
+		}
 		return
 	}
 	fmt.Fprintf(out, "Отчёт сохранён: %s.txt и %s\n", base, *jsonOut)
+	if reportFile != nil {
+		_ = reportFile.Sync()
+	}
+	if clicked {
+		fmt.Fprintf(os.Stderr, "\nГотово за %s. dpiprobe %s.\nОтчёт: %s.txt\n", time.Since(start).Round(time.Second), version, base)
+		time.Sleep(2 * time.Second)
+	}
 }
 
 var out io.Writer = os.Stdout
@@ -162,12 +239,14 @@ func reportBase() string {
 	return filepath.Join(dir, "dpiprobe-"+time.Now().Format("20060102-150405"))
 }
 
-func waitIfOwnConsole() {
-	if !ownConsole() {
-		return
+func drop(order []string, gone ...string) []string {
+	var out []string
+	for _, s := range order {
+		if !slices.Contains(gone, s) {
+			out = append(out, s)
+		}
 	}
-	fmt.Fprint(os.Stderr, "\nНажмите Enter, чтобы закрыть окно…")
-	_, _ = bufio.NewReader(os.Stdin).ReadString('\n')
+	return out
 }
 
 func splitList(s string) []string {
@@ -180,8 +259,6 @@ func splitList(s string) []string {
 	return out
 }
 
-func progress(s string) { fmt.Fprintln(os.Stderr, "→ "+s) }
-
 func header(s string) { fmt.Fprintf(out, "\n== %s ==\n", s) }
 
 func table() *tabwriter.Writer { return tabwriter.NewWriter(out, 0, 0, 2, ' ', 0) }
@@ -189,6 +266,9 @@ func table() *tabwriter.Writer { return tabwriter.NewWriter(out, 0, 0, 2, ' ', 0
 func ms(d time.Duration) string {
 	if d == 0 {
 		return "—"
+	}
+	if d < time.Millisecond {
+		return strings.Replace(fmt.Sprintf("%.1f мс", float64(d)/float64(time.Millisecond)), ".", ",", 1)
 	}
 	return fmt.Sprintf("%d мс", d.Milliseconds())
 }
@@ -388,6 +468,28 @@ func printQUIC(q probe.QUICReport) {
 	} else {
 		fmt.Fprintln(out, "  Нет зарубежного QUIC-сервера, который отвечает на любое имя: причину молчания сайтов не уточнить.")
 	}
+	if len(q.STUN) > 0 {
+		var parts []string
+		for _, s := range q.STUN {
+			switch {
+			case s.OK:
+				parts = append(parts, fmt.Sprintf("%s %s", s.Name, ms(s.RTT)))
+			case s.RTT > 0 && s.Err != "":
+				parts = append(parts, fmt.Sprintf("%s: %s (%s)", s.Name, s.Err, ms(s.RTT)))
+			case s.Err != "":
+				parts = append(parts, s.Name+": "+s.Err)
+			default:
+				parts = append(parts, s.Name+" нет ответа")
+			}
+		}
+		fmt.Fprintf(out, "  UDP (STUN): %s.\n", strings.Join(parts, ", "))
+	}
+	switch {
+	case q.FatStatus == "TOO BIG":
+		fmt.Fprintln(out, "  Пакет 1400 байт сокет не отправил: для локального MTU он слишком большой. В сеть он не ушёл.")
+	case q.FatStatus != "" && q.FatStatus != "OK":
+		fmt.Fprintf(out, "  Пакет 1400 байт: %s (1200 байт до этого адреса проходил).\n", q.FatStatus)
+	}
 	if len(q.Sites) > 0 {
 		w := table()
 		fmt.Fprintln(w, "  Домен\tIP\tQUIC\tВывод")
@@ -457,10 +559,32 @@ func printQUICSummary(q probe.QUICReport, tls []probe.TLSResult, vpnOn bool) {
 		if toRU > 0 {
 			fmt.Fprintf(out, "  • По QUIC к российскому адресу запрещённые имена проходят (%d из %d).\n", toRU, sni)
 		}
+		for _, s := range q.Sites {
+			if strings.Contains(s.Verdict, "STUN") || strings.Contains(s.Verdict, "grease") {
+				fmt.Fprintf(out, "  • %s: %s.\n", s.Domain, s.Verdict)
+			}
+		}
+		switch q.FatStatus {
+		case "TOO BIG":
+			fmt.Fprintln(out, "  • Пакет 1400 байт сокет не отправил, в сеть он не ушёл.")
+		case "", "OK":
+		default:
+			fmt.Fprintf(out, "  • Пакет 1400 байт: %s (1200 до этого адреса проходил).\n", q.FatStatus)
+		}
 	}
 	for _, t := range q.Targets {
 		fmt.Fprintf(out, "  • %s по UDP: %s.\n", t.Domain, t.Verdict)
 	}
+}
+
+func printBypass(b probe.BypassReport) {
+	fmt.Fprintf(out, "  Обход SNI на %s (%s):\n", b.Domain, b.IP)
+	w := table()
+	fmt.Fprintln(w, "  Проба\tСтатус\tПодробнее")
+	for _, pr := range b.Probes {
+		fmt.Fprintf(w, "  %s\t%s\t%s\n", pr.Name, pr.Status, pr.Detail)
+	}
+	w.Flush()
 }
 
 func printTCP16(rs []probe.TCP16Result) {
@@ -502,7 +626,6 @@ func printTelegram(t probe.TelegramReport) {
 	w.Flush()
 	if t.MediaErr != "" {
 		fmt.Fprintf(out, "  telegram.org: %s (скачано %.0f КБ)\n", t.MediaErr, float64(t.MediaBytes)/1024)
-	} else {
 		fmt.Fprintf(out, "  telegram.org: %.0f КБ, %.0f КБ/с\n", float64(t.MediaBytes)/1024, t.MediaKBps)
 	}
 }
@@ -582,6 +705,11 @@ func printSummary(r report) {
 		if count["toRU"] > 0 {
 			fmt.Fprintf(out, "  • К российскому адресу (ya.ru) запрещённые имена проходят (%d из %d): похоже, SNI проверяют только в трафике за рубеж.\n",
 				count["toRU"], blocked)
+		}
+	}
+	if r.Bypass != nil {
+		if line := r.Bypass.Line(); line != "" {
+			fmt.Fprintln(out, "  • "+line)
 		}
 	}
 	if r.QUIC != nil {

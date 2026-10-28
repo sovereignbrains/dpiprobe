@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // reply builds a response to q with the given A records and rcode.
@@ -94,6 +96,59 @@ func TestEmbeddedLists(t *testing.T) {
 	}
 	if len(WhitelistSNI()) < 100 {
 		t.Error("whitelist too short")
+	}
+}
+
+func TestSilenceWindow(t *testing.T) {
+	p := New(8*time.Second, 1)
+	if g := p.silenceWindow(10 * time.Millisecond); g != 400*time.Millisecond {
+		t.Fatalf("floor: %s", g)
+	}
+	if g := p.silenceWindow(100 * time.Millisecond); g != 800*time.Millisecond {
+		t.Fatalf("8*rtt: %s", g)
+	}
+	if g := p.silenceWindow(time.Second); g != 1500*time.Millisecond {
+		t.Fatalf("cap: %s", g)
+	}
+	p.Timeout = 300 * time.Millisecond
+	if g := p.silenceWindow(time.Second); g != 300*time.Millisecond {
+		t.Fatalf("probe timeout: %s", g)
+	}
+}
+
+func TestParseHTTPSExtractsECH(t *testing.T) {
+	q := buildQuery("example.com", typeHTTPS)
+	m := reply(q, 0)
+	binary.BigEndian.PutUint16(m[6:], 1)
+	ech := []byte{0x00, 0x04, 0x01, 0x02, 0x03, 0x04}
+	rd := []byte{0x00, 0x01, 0x00}          // priority 1, root target
+	rd = append(rd, 0x00, 0x01, 0x00, 0x00) // alpn, empty
+	rd = append(rd, 0x00, svcParamECH)
+	rd = binary.BigEndian.AppendUint16(rd, uint16(len(ech)))
+	rd = append(rd, ech...)
+	m = append(m, 0xc0, 12, 0, typeHTTPS, 0, 1, 0, 0, 0, 60)
+	m = binary.BigEndian.AppendUint16(m, uint16(len(rd)))
+	m = append(m, rd...)
+	a, err := parseResponse(m, q)
+	if err != nil || !bytes.Equal(a.ech, ech) {
+		t.Fatalf("got %x, %v", a.ech, err)
+	}
+}
+
+func TestSplitRecordKeepsSNIOut(t *testing.T) {
+	flight, err := clientHelloFlight("blocked.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second, err := splitRecordBefore(flight, []byte("blocked.example"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(first, []byte("blocked.example")) {
+		t.Fatal("SNI leaked into the first record")
+	}
+	if !bytes.Contains(second, []byte("blocked.example")) {
+		t.Fatal("SNI missing from the second record")
 	}
 }
 

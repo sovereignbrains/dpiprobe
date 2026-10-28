@@ -47,7 +47,7 @@ type TelegramReport struct {
 func (p *Prober) CheckTelegram(ctx context.Context) TelegramReport {
 	var rep TelegramReport
 	rep.DCs = make([]DCResult, len(telegramDCs))
-	p.forEach(len(telegramDCs), func(i int) {
+	p.forEachCounted("TG", len(telegramDCs), func(i int) {
 		dc := telegramDCs[i]
 		rtt, st := p.mtprotoPing(ctx, dc.IP)
 		rep.DCs[i] = DCResult{Name: dc.Name, IP: dc.IP, Status: st, RTT: rtt}

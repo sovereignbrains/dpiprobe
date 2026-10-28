@@ -19,16 +19,17 @@ var httpPort = "80"
 // or a reset.
 func (p *Prober) httpProbe(ctx context.Context, ip, domain string) (status, detail string) {
 	d := net.Dialer{Timeout: p.Timeout}
+	t0 := time.Now()
 	c, err := d.DialContext(ctx, "tcp4", net.JoinHostPort(ip, httpPort))
 	if err != nil {
 		return statusFor(stageTCP, err), shortErr(err)
 	}
 	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(p.Timeout))
-	if _, err := fmt.Fprintf(c, "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nConnection: close\r\n\r\n", domain, userAgent); err != nil {
+	sc := p.armSilence(c, time.Since(t0))
+	if _, err := fmt.Fprintf(sc, "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: */*\r\nConnection: close\r\n\r\n", domain, userAgent); err != nil {
 		return statusFor(stageData, err), shortErr(err)
 	}
-	resp, err := http.ReadResponse(bufio.NewReader(c), &http.Request{Method: http.MethodGet})
+	resp, err := http.ReadResponse(bufio.NewReader(sc), &http.Request{Method: http.MethodGet})
 	if err != nil {
 		return statusFor(stageData, err), shortErr(err)
 	}

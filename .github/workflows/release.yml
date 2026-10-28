@@ -25,9 +25,11 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           mkdir dist
-          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/dpiprobe.exe ./cmd/dpiprobe
-          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-s -w" -o dist/dpiprobe-linux-amd64 ./cmd/dpiprobe
-          GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/dpiprobe-macos-arm64 ./cmd/dpiprobe
+          VER="${GITHUB_REF_NAME#v}"
+          LDFLAGS="-s -w -X main.version=$VER"
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/dpiprobe.exe ./cmd/dpiprobe
+          GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/dpiprobe-linux-amd64 ./cmd/dpiprobe
+          GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/dpiprobe-macos-arm64 ./cmd/dpiprobe
           cd dist && sha256sum dpiprobe* > SHA256SUMS.txt
       - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
@@ -39,9 +41,9 @@ jobs:
         run: |
           {
             cat <<'EOF'
-          Скачайте `dpiprobe.exe`, **выключите VPN** и запустите двойным кликом. Через 3–5 минут отчёт сохранится рядом с exe (`.txt` и `.json`).
+          Скачайте `dpiprobe.exe`, **выключите VPN** и запустите двойным кликом. Через 3–5 минут отчёт сохранится рядом с exe (`.txt` и `.json`). Окно закроется само. Следующие версии подтянутся сами при запуске; без совпадения SHA-256 файл не ставится.
 
-          Проверяет: подмену и перехват DNS, какой зашифрованный DNS (DoH/DoT) у вас работает и не врёт, сайты по HTTP и TLS с разбором причины (DPI по SNI / блок по IP / связка), обрыв соединений после 16–20 КБ к ~110 адресам хостингов и CDN с подбором белых SNI, доступность Telegram по протоколу MTProto.
+          Проверяет: подмену и перехват DNS, какой зашифрованный DNS (DoH/DoT) у вас работает и не врёт, сайты по HTTP и TLS с разбором причины (DPI по SNI / блок по IP / связка), QUIC, обрыв соединений после 16–20 КБ к ~110 адресам хостингов и CDN с подбором белых SNI, доступность Telegram по протоколу MTProto.
 
           **Файлы собраны GitHub Actions из этого коммита, а не на чьём-то компьютере.** Проверить:
 

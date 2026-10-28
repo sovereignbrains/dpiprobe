@@ -73,6 +73,44 @@ func bigBody(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write(make([]byte, 32<<10))
 }
 
+func TestConfirmOncePerASN(t *testing.T) {
+	var accepts atomic.Int32
+	s := httptest.NewUnstartedServer(http.HandlerFunc(bigBody))
+	s.Listener = acceptCount{Listener: freezeListener{Listener: s.Listener, freezeAfter: 16 << 10}, n: &accepts}
+	s.Config.MaxHeaderBytes = 1 << 20
+	s.StartTLS()
+	t.Cleanup(s.Close)
+	host, ps, _ := net.SplitHostPort(strings.TrimPrefix(s.URL, "https://"))
+	port, _ := strconv.Atoi(ps)
+	p := New(time.Second, 2)
+	rs := p.CheckTCP16(context.Background(), []Target{
+		{ID: "a", ASN: "1", IP: host, Port: port},
+		{ID: "b", ASN: "1", IP: host, Port: port},
+	}, nil)
+	for _, r := range rs {
+		if r.Verdict != "DETECTED" {
+			t.Fatalf("verdict %+v", r)
+		}
+	}
+	if n := accepts.Load(); n != 3 {
+		t.Fatalf("connections %d, want 3 (two probes and one confirm)", n)
+	}
+}
+
+type acceptCount struct {
+	net.Listener
+	n *atomic.Int32
+}
+
+func (l acceptCount) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	l.n.Add(1)
+	return c, nil
+}
+
 func TestFatDetectsFreeze(t *testing.T) {
 	ip, port := startServer(t, 16<<10, bigBody)
 	p := New(time.Second, 4)

@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"net"
+	"strconv"
 	"time"
 )
 
@@ -40,17 +42,38 @@ type hsResult struct {
 func (h hsResult) reached() bool { return h.status == "OK" || h.status == "TLS ALERT" }
 
 func (p *Prober) handshake(ctx context.Context, ip, sni string) hsResult {
+	return p.dialTLS(ctx, ip, 443, &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: true, //nolint:gosec // verification is verifyCert, after the handshake
+		NextProtos:         []string{"http/1.1"},
+	}, nil)
+}
+
+// dialTLS completes one handshake. wrap, when set, sits on the raw
+// connection — the 1-byte segmentation probe uses it. The handshake itself
+// waits the full probe timeout: a short silence window turns a delayed
+// ServerHello into TLS DROP and hides what happens after it.
+func (p *Prober) dialTLS(ctx context.Context, ip string, port int, cfg *tls.Config, wrap func(net.Conn) net.Conn) hsResult {
 	d := net.Dialer{Timeout: p.Timeout}
-	raw, err := d.DialContext(ctx, "tcp4", net.JoinHostPort(ip, "443"))
+	raw, err := d.DialContext(ctx, "tcp4", net.JoinHostPort(ip, strconv.Itoa(port)))
 	if err != nil {
 		return hsResult{status: statusFor(stageTCP, err), detail: shortErr(err)}
 	}
 	defer raw.Close()
-	_ = raw.SetDeadline(time.Now().Add(p.Timeout))
-	// Verification is done separately in verifyCert: a probe must finish the
-	// handshake to see what certificate comes back.
-	c := tls.Client(raw, &tls.Config{ServerName: sni, InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}}) //nolint:gosec
+	if tc, ok := raw.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+	_ = raw.SetDeadline(time.Now().Add(p.handshakeWait()))
+	var conn net.Conn = raw
+	if wrap != nil {
+		conn = wrap(conn)
+	}
+	c := tls.Client(conn, cfg)
 	if err := c.HandshakeContext(ctx); err != nil {
+		var rej *tls.ECHRejectionError
+		if errors.As(err, &rej) {
+			return hsResult{status: "ECH REJECT", detail: "\u0441\u0435\u0440\u0432\u0435\u0440 \u043e\u0442\u0432\u0435\u0442\u0438\u043b, ECH \u043d\u0435 \u043f\u0440\u0438\u043d\u044f\u043b"}
+		}
 		return hsResult{status: statusFor(stageTLS, err), detail: shortErr(err)}
 	}
 	return hsResult{status: "OK", certs: c.ConnectionState().PeerCertificates}
@@ -75,7 +98,7 @@ func (p *Prober) tlsControls(ctx context.Context) tlsControls {
 func (p *Prober) CheckTLS(ctx context.Context, domains []string) []TLSResult {
 	ctl := p.tlsControls(ctx)
 	out := make([]TLSResult, len(domains))
-	p.forEachCounted(len(domains), func(i int) { out[i] = p.checkTLSDomain(ctx, domains[i], ctl) })
+	p.forEachCounted("Сайты", len(domains), func(i int) { out[i] = p.checkTLSDomain(ctx, domains[i], ctl) })
 	return out
 }
 
