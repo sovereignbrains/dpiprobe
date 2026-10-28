@@ -2,3 +2,4 @@
 /dpiprobe-*.txt
 /dpiprobe-*.json
 /*.json
+/reports/

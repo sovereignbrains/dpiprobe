@@ -39,6 +39,8 @@ func main() {
 	timeout := flag.Duration("timeout", 8*time.Second, "таймаут одной пробы")
 	sniSearch := flag.Bool("sni", true, "искать белые SNI для сетей с обрывом")
 	noupdate := flag.Bool("noupdate", false, "не проверять GitHub на новую версию")
+	sendReport := flag.Bool("send", false, "отправить обезличенный отчёт без вопроса")
+	nosend := flag.Bool("nosend", false, "не спрашивать и не отправлять отчёт")
 	flag.Parse()
 
 	onlySet := false
@@ -223,6 +225,16 @@ func main() {
 	if reportFile != nil {
 		_ = reportFile.Sync()
 	}
+	offerReport(ctx, offerOpts{
+		rep:        rep,
+		dur:        time.Since(start),
+		domains:    splitList(*domains),
+		targets:    own,
+		flagSend:   *sendReport,
+		flagNosend: *nosend,
+		sentPath:   base + "-sent.json",
+		reportFile: reportFile,
+	})
 	if clicked {
 		fmt.Fprintf(os.Stderr, "\nГотово за %s. dpiprobe %s.\nОтчёт: %s.txt\n", time.Since(start).Round(time.Second), version, base)
 		time.Sleep(2 * time.Second)

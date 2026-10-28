@@ -1,0 +1,8 @@
+name = "dpiprobe-reports"
+main = "index.js"
+compatibility_date = "2026-09-01"
+workers_dev = true
+
+# account_id is not stored in this repo. Set CLOUDFLARE_ACCOUNT_ID to deploy.
+# RATE — KV namespace titled dpiprobe-reports (rate limit and fallback store).
+# REPORTS — R2 bucket dpiprobe-reports, only when R2 is enabled on the account.

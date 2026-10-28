@@ -14,7 +14,7 @@ import (
 )
 
 func TestDefaultVersionIsNextRelease(t *testing.T) {
-	if version != "0.3.1" {
+	if version != "0.3.2" {
 		t.Fatalf("default version %s", version)
 	}
 }

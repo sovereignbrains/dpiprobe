@@ -24,7 +24,7 @@ import (
 // The default is the next version about to be published. A lower default
 // makes an exe built by hand in this folder replace itself with the GitHub
 // release.
-var version = "0.3.1"
+var version = "0.3.2"
 
 const updateRepo = "sovereignbrains/dpiprobe"
 
