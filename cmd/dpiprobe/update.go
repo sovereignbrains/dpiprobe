@@ -21,9 +21,10 @@ import (
 )
 
 // version is overwritten by -ldflags "-X main.version=…" on a tagged release.
-// The local default stays above GitHub v0.2.1 so a hand-built exe is not
-// overwritten by the older published tag.
-var version = "0.3.0"
+// The default is the next version about to be published. A lower default
+// makes an exe built by hand in this folder replace itself with the GitHub
+// release.
+var version = "0.3.1"
 
 const updateRepo = "sovereignbrains/dpiprobe"
 
@@ -264,8 +265,13 @@ func downloadExe(ctx context.Context, clients []*http.Client, url, dest string, 
 	if resp.StatusCode != http.StatusOK {
 		return zero, fmt.Errorf("скачать: %s", resp.Status)
 	}
+	declared := size
 	if size <= 0 {
 		size = resp.ContentLength
+	}
+	var body io.Reader = resp.Body
+	if declared > 0 {
+		body = io.LimitReader(resp.Body, declared)
 	}
 	f, err := os.Create(dest)
 	if err != nil {
@@ -278,7 +284,7 @@ func downloadExe(ctx context.Context, clients []*http.Client, url, dest string, 
 	buf := make([]byte, 32*1024)
 	head := make([]byte, 0, 2)
 	for {
-		n, err := resp.Body.Read(buf)
+		n, err := body.Read(buf)
 		if n > 0 {
 			if len(head) < 2 {
 				need := min(2-len(head), n)
@@ -304,6 +310,16 @@ func downloadExe(ctx context.Context, clients []*http.Client, url, dest string, 
 	}
 	if len(head) < 2 || head[0] != 'M' || head[1] != 'Z' {
 		return zero, fmt.Errorf("это не exe")
+	}
+	if declared > 0 {
+		var extra [1]byte
+		n, err := resp.Body.Read(extra[:])
+		if n > 0 {
+			return zero, fmt.Errorf("размер не сошёлся")
+		}
+		if err != nil && err != io.EOF {
+			return zero, err
+		}
 	}
 	if err := f.Close(); err != nil {
 		return zero, err

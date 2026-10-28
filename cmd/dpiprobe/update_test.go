@@ -1,13 +1,46 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/sovereignbrains/dpiprobe/probe"
 )
+
+func TestDefaultVersionIsNextRelease(t *testing.T) {
+	if version != "0.3.1" {
+		t.Fatalf("default version %s", version)
+	}
+}
+
+func TestDownloadExeRejectsLongerBody(t *testing.T) {
+	const declared int64 = 32
+	exact := append([]byte("MZ"), bytes.Repeat([]byte{'x'}, int(declared)-2)...)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := exact
+		if r.URL.Query().Get("more") == "1" {
+			body = append(append([]byte{}, exact...), 'Z')
+		}
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	client := srv.Client()
+	dest := filepath.Join(t.TempDir(), "exact.exe")
+	if _, err := downloadExe(context.Background(), []*http.Client{client}, srv.URL, dest, declared, nil); err != nil {
+		t.Fatal(err)
+	}
+	dest2 := filepath.Join(t.TempDir(), "long.exe")
+	_, err := downloadExe(context.Background(), []*http.Client{client}, srv.URL+"?more=1", dest2, declared, nil)
+	if err == nil || !strings.Contains(err.Error(), "размер не сошёлся") {
+		t.Fatalf("got %v", err)
+	}
+}
 
 func TestVerLess(t *testing.T) {
 	cases := []struct {

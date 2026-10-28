@@ -7,6 +7,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -227,4 +228,209 @@ func TestQUICReplyNeedsOurConnectionID(t *testing.T) {
 			t.Errorf("%s: got %v, want %v", c.name, got, c.want)
 		}
 	}
+}
+
+func TestFillQUICVerdict(t *testing.T) {
+	p := New(time.Second, 1)
+	cases := []struct {
+		name  string
+		same  string
+		tries []quicForeignTry
+		want  string
+		miss  bool
+	}{
+		{
+			name: "control silent once, answers on retry",
+			same: "OK",
+			tries: []quicForeignTry{
+				{Neutral: "OK", Name: "NO REPLY"},
+				{Neutral: "OK", Name: "OK"},
+			},
+			want: "по отдельности адрес и имя проходят — блок только на их сочетание",
+		},
+		{
+			name: "control silent once, answers on retry, address silent",
+			same: "NO REPLY",
+			tries: []quicForeignTry{
+				{Neutral: "OK", Name: "NO REPLY"},
+				{Neutral: "OK", Name: "OK"},
+			},
+			want: "адрес не отвечает по QUIC (QUIC у сайта нет или UDP к адресу закрыт)",
+		},
+		{
+			name: "control silent on neutral too",
+			same: "NO REPLY",
+			tries: []quicForeignTry{
+				{Neutral: "NO REPLY", Name: "NO REPLY"},
+				{Neutral: "NO REPLY", Name: "NO REPLY"},
+			},
+			want: "нет ответа и с нейтральным SNI",
+		},
+		{
+			name: "control silent on neutral, address answers",
+			same: "OK",
+			tries: []quicForeignTry{
+				{Neutral: "NO REPLY", Name: "NO REPLY"},
+			},
+			want: "похоже на DPI по SNI (нет зарубежного QUIC-сервера для сверки)",
+		},
+		{
+			name: "two silences but the address itself is silent",
+			same: "NO REPLY",
+			tries: []quicForeignTry{
+				{Neutral: "OK", Name: "NO REPLY"},
+				{Neutral: "OK", Name: "NO REPLY"},
+			},
+			want: "адрес по QUIC не отвечает",
+			miss: true,
+		},
+		{
+			name: "two silences and the address answers a neutral name",
+			same: "OK",
+			tries: []quicForeignTry{
+				{Neutral: "OK", Name: "NO REPLY"},
+				{Neutral: "OK", Name: "NO REPLY"},
+			},
+			want: "DPI по SNI: имя режется и на чистом адресе",
+			miss: true,
+		},
+		{
+			name: "one silence is not a cut",
+			same: "OK",
+			tries: []quicForeignTry{
+				{Neutral: "OK", Name: "NO REPLY"},
+			},
+			want: "сверочный сервер на это имя промолчал один раз — за рез по имени не считаем",
+			miss: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := &QUICResult{Status: "NO REPLY", Domain: "blocked.example"}
+			p.fillQUIC(r, c.same, c.tries)
+			if r.Verdict != c.want || r.ControlMiss != c.miss {
+				t.Fatalf("verdict %q miss %v, want %q miss %v", r.Verdict, r.ControlMiss, c.want, c.miss)
+			}
+			if c.miss && (stringsHasCut(r.Verdict) && c.same != "OK" || (c.same != "OK" && stringsHasCut(r.Verdict))) {
+				t.Fatalf("address-silent verdict claims a cut: %q", r.Verdict)
+			}
+		})
+	}
+}
+
+func stringsHasCut(v string) bool {
+	return len(v) >= len("имя режется") && (bytes.HasPrefix([]byte(v), []byte("имя режется")) || bytes.HasPrefix([]byte(v), []byte("DPI по SNI")))
+}
+
+func TestQUICControlRetriesSilentName(t *testing.T) {
+	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		buf := make([]byte, 2048)
+		seen := map[string]int{}
+		known := map[string]bool{}
+		_ = pc.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for {
+			n, addr, err := pc.ReadFromUDP(buf)
+			if err != nil {
+				return
+			}
+			pkt := append([]byte(nil), buf[:n]...)
+			id := scidOf(pkt)
+			payload, err := initialPayload(pkt)
+			if id == nil || err != nil {
+				continue
+			}
+			sni := ""
+			switch {
+			case bytes.Contains(payload, []byte(tlsRUControl)):
+				sni = tlsRUControl
+			case bytes.Contains(payload, []byte("blocked.example")):
+				sni = "blocked.example"
+			default:
+				continue
+			}
+			key := sni + "/" + string(id)
+			if !known[key] {
+				known[key] = true
+				seen[sni]++
+			}
+			if sni != tlsRUControl && seen["blocked.example"] < 2 {
+				continue
+			}
+			reply := append([]byte{0xc0, 0, 0, 0, 1, byte(len(id))}, id...)
+			_, _ = pc.WriteToUDP(reply, addr)
+		}
+	}()
+	p := New(2*time.Second, 1)
+	port := pc.LocalAddr().(*net.UDPAddr).Port
+	got := p.quicControlNames(context.Background(), "127.0.0.1", port, []string{"blocked.example"}, 20*time.Millisecond)
+	pc.Close()
+	<-done
+	tries := got["blocked.example"]
+	if len(tries) < 2 {
+		t.Fatalf("tries %+v", tries)
+	}
+	if tries[0].Neutral != "OK" || tries[0].Name == "OK" {
+		t.Fatalf("first try %+v", tries[0])
+	}
+	if tries[1].Neutral != "OK" || tries[1].Name != "OK" {
+		t.Fatalf("retry %+v", tries)
+	}
+	r := &QUICResult{Status: "NO REPLY"}
+	p.fillQUIC(r, "NO REPLY", tries)
+	if r.Verdict != "адрес не отвечает по QUIC (QUIC у сайта нет или UDP к адресу закрыт)" || r.ControlMiss {
+		t.Fatalf("verdict %q miss %v", r.Verdict, r.ControlMiss)
+	}
+}
+
+func initialPayload(pkt []byte) ([]byte, error) {
+	if len(pkt) < 7 || pkt[0]&0x80 == 0 {
+		return nil, errors.New("not a long header")
+	}
+	dcid := pkt[6 : 6+int(pkt[5])]
+	off := 6 + len(dcid)
+	if off >= len(pkt) {
+		return nil, errors.New("truncated")
+	}
+	off += 1 + int(pkt[off])
+	if off >= len(pkt) {
+		return nil, errors.New("token")
+	}
+	off++
+	off += 2
+	if off+20 > len(pkt) {
+		return nil, errors.New("short")
+	}
+	k := clientInitialKeys(dcid)
+	hp, err := aes.NewCipher(k.hp)
+	if err != nil {
+		return nil, err
+	}
+	mask := make([]byte, 16)
+	hp.Encrypt(mask, pkt[off+4:off+20])
+	hdr := bytes.Clone(pkt[:off+4])
+	hdr[0] ^= mask[0] & 0x0f
+	for i := range 4 {
+		hdr[off+i] ^= mask[1+i]
+	}
+	pn := binary.BigEndian.Uint32(hdr[off:])
+	block, err := aes.NewCipher(k.key)
+	if err != nil {
+		return nil, err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := bytes.Clone(k.iv)
+	for i := range 4 {
+		nonce[8+i] ^= byte(pn >> (24 - 8*i))
+	}
+	return aead.Open(nil, nonce, pkt[off+4:], hdr)
 }

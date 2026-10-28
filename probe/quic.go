@@ -28,6 +28,10 @@ type QUICResult struct {
 	RTT     time.Duration
 	// PassesToRU: the blocked name got a reply from a Russian address.
 	PassesToRU bool
+	// ControlMiss: a live foreign control stayed silent on this name.
+	// One miss is packet loss, not DPI; the summary says so when other
+	// names still answer QUIC with their own SNI.
+	ControlMiss bool
 }
 
 type QUICReport struct {
@@ -384,9 +388,9 @@ func (p *Prober) CheckQUIC(ctx context.Context, domains []string, targets []Targ
 		if s.IP == "" || s.Status == "OK" || s.Status == "FAKE" || s.Status == "DNS FAIL" {
 			continue
 		}
-		if r.Control != "" {
-			add(&second, seen2, quicShot{ip: r.Control, port: 443, sni: s.Domain})
-		}
+		// The control address is probed on its own, a few names at a time.
+		// Putting every silent name into this burst (~24 Initials at once)
+		// loses datagrams and used to look like "the name is cut".
 		if ru != "" {
 			add(&second, seen2, quicShot{ip: ru, port: 443, sni: s.Domain})
 		}
@@ -423,24 +427,30 @@ func (p *Prober) CheckQUIC(ctx context.Context, domains []string, targets []Targ
 			s.Verdict = "обычный Initial проигнорирован, пакет с grease прошёл"
 			continue
 		}
-		if h, ok := m2.get(s.IP, tlsRUControl, 443, quicPacketGrease); ok && h.status == "OK" && s.Status == "NO REPLY" {
-			// The address answers a browser-like packet. Own-name silence
-			// with that packet is handled below if it stayed NO REPLY.
-			_ = h
-		}
-		same, _ := m.get(s.IP, tlsRUControl, 443, quicPacketStd)
-		foreign := quicHit{status: "NO REPLY"}
-		if r.Control != "" {
-			if h, ok := m2.get(r.Control, s.Domain, 443, quicPacketStd); ok {
-				foreign = h
-			}
-		}
 		if ru != "" {
 			if h, ok := m2.get(ru, s.Domain, 443, quicPacketStd); ok && h.status == "OK" {
 				s.PassesToRU = true
 			}
 		}
-		p.fillQUIC(s, same.status, foreign.status, r.Control)
+	}
+	var needControl []string
+	if r.Control != "" {
+		for i := range r.Sites {
+			s := &r.Sites[i]
+			if s.IP == "" || s.Status == "OK" || s.Status == "FAKE" || s.Status == "DNS FAIL" {
+				continue
+			}
+			needControl = append(needControl, s.Domain)
+		}
+	}
+	tries := p.quicControlNames(ctx, r.Control, 443, needControl, r.ControlRTT)
+	for i := range r.Sites {
+		s := &r.Sites[i]
+		if s.IP == "" || s.Status == "OK" || s.Status == "DNS FAIL" {
+			continue
+		}
+		same, _ := m.get(s.IP, tlsRUControl, 443, quicPacketStd)
+		p.fillQUIC(s, same.status, tries[s.Domain])
 	}
 
 	// ICMP on one datagram separates "port closed" from a black hole.
@@ -546,7 +556,107 @@ func firstQUICAnswer(r QUICReport, m hitMap) (ip, sni string, port int, rtt time
 	return "", "", 0, 0
 }
 
-func (p *Prober) fillQUIC(r *QUICResult, sameIP, foreign, control string) {
+// quicControlBatch is how many blocked names share one burst to the control.
+// A few dozen Initials at once get lost or rate-limited and look like DPI.
+const quicControlBatch = 4
+
+// quicForeignTry is one burst to the control address. It counts only when
+// Neutral is OK: the control answered a neutral name in that same burst.
+type quicForeignTry struct {
+	Neutral string
+	Name    string
+}
+
+// quicControlNames probes each name on the control address, with a neutral-SNI
+// check in the same burst, and retries a name that did not come back OK.
+// Two confirmed silences are required before a verdict calls the name cut.
+func (p *Prober) quicControlNames(ctx context.Context, control string, port int, names []string, rtt time.Duration) map[string][]quicForeignTry {
+	out := map[string][]quicForeignTry{}
+	if control == "" || len(names) == 0 {
+		return out
+	}
+	pending := names
+	for pass := 0; pass < 2 && len(pending) > 0 && ctx.Err() == nil; pass++ {
+		var next []string
+		for i := 0; i < len(pending); i += quicControlBatch {
+			if ctx.Err() != nil {
+				return out
+			}
+			chunk := pending[i:min(i+quicControlBatch, len(pending))]
+			shots := []quicShot{{ip: control, port: port, sni: tlsRUControl}}
+			for _, n := range chunk {
+				if n == tlsRUControl {
+					continue
+				}
+				shots = append(shots, quicShot{ip: control, port: port, sni: n})
+			}
+			hits, _ := p.quicBurst(ctx, shots, rtt, false)
+			m := indexHits(shots, hits)
+			neu := "NO REPLY"
+			if h, ok := m.get(control, tlsRUControl, port, quicPacketStd); ok {
+				neu = h.status
+			}
+			for _, n := range chunk {
+				st := neu
+				if n != tlsRUControl {
+					st = "NO REPLY"
+					if h, ok := m.get(control, n, port, quicPacketStd); ok {
+						st = h.status
+					}
+				}
+				out[n] = append(out[n], quicForeignTry{Neutral: neu, Name: st})
+				if pass == 0 && !(neu == "OK" && st == "OK") {
+					next = append(next, n)
+				}
+			}
+		}
+		pending = next
+	}
+	return out
+}
+
+// quicCrossVerdict explains a site that stayed silent with its own name.
+// "The name is cut" needs the control to answer a neutral name and to stay
+// silent on this name at least twice. If the control never answers the
+// neutral name, the verdict is the one used when there is no control.
+// When the site address is silent even with a neutral SNI, the verdict
+// leads with that, not with a cut name.
+func quicCrossVerdict(sameIP string, tries []quicForeignTry) (verdict string, controlMiss bool) {
+	confirmedSilent := 0
+	foreignOK := false
+	controlAlive := false
+	for _, t := range tries {
+		if t.Neutral != "OK" {
+			continue
+		}
+		controlAlive = true
+		if t.Name == "OK" {
+			foreignOK = true
+			break
+		}
+		confirmedSilent++
+	}
+	if !controlAlive {
+		if sameIP == "OK" {
+			return "похоже на DPI по SNI (нет зарубежного QUIC-сервера для сверки)", false
+		}
+		return "нет ответа и с нейтральным SNI", false
+	}
+	switch {
+	case foreignOK && sameIP == "OK":
+		return "по отдельности адрес и имя проходят — блок только на их сочетание", false
+	case foreignOK:
+		return "адрес не отвечает по QUIC (QUIC у сайта нет или UDP к адресу закрыт)", false
+	case sameIP == "OK" && confirmedSilent >= 2:
+		return "DPI по SNI: имя режется и на чистом адресе", true
+	case sameIP == "OK":
+		return "сверочный сервер на это имя промолчал один раз — за рез по имени не считаем", true
+	default:
+		return "адрес по QUIC не отвечает", true
+	}
+}
+
+func (p *Prober) fillQUIC(r *QUICResult, sameIP string, tries []quicForeignTry) {
 	if r.Status == "FAKE" {
 		r.Verdict = "ответил не сервер: пакет на чужой запрос, QUIC перехватывают по пути"
 		return
@@ -554,24 +664,7 @@ func (p *Prober) fillQUIC(r *QUICResult, sameIP, foreign, control string) {
 	if r.Status == "OK" {
 		return
 	}
-	if control == "" {
-		if sameIP == "OK" {
-			r.Verdict = "похоже на DPI по SNI (нет зарубежного QUIC-сервера для сверки)"
-		} else {
-			r.Verdict = "нет ответа и с нейтральным SNI"
-		}
-		return
-	}
-	switch {
-	case sameIP == "OK" && foreign != "OK":
-		r.Verdict = "DPI по SNI: имя режется и на чистом адресе"
-	case sameIP != "OK" && foreign != "OK":
-		r.Verdict = "имя режется; адрес по QUIC не отвечает"
-	case sameIP != "OK":
-		r.Verdict = "адрес не отвечает по QUIC (QUIC у сайта нет или UDP к адресу закрыт)"
-	default:
-		r.Verdict = "по отдельности адрес и имя проходят — блок только на их сочетание"
-	}
+	r.Verdict, r.ControlMiss = quicCrossVerdict(sameIP, tries)
 }
 
 func (p *Prober) refineSilence(r *QUICResult, icmp string, googleSTUN, googleSilent bool) {
@@ -580,6 +673,7 @@ func (p *Prober) refineSilence(r *QUICResult, icmp string, googleSTUN, googleSil
 			r.Verdict = "имя режется; QUIC у сайта нет (порт закрыт)"
 			return
 		}
+		r.ControlMiss = false
 		r.Status = "ICMP"
 		r.Verdict = "QUIC у сайта нет: порт закрыт"
 		return
@@ -616,6 +710,7 @@ func (p *Prober) udpFeel(ctx context.Context, ip string, port int) string {
 	}
 	switch kindOf(err) {
 	case kUnreach, kRefused, kReset:
+
 		return "ICMP"
 	default:
 		return "NO REPLY"

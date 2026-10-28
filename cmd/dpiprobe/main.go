@@ -518,15 +518,20 @@ func printQUICSummary(q probe.QUICReport, tls []probe.TLSResult, vpnOn bool) {
 	}
 	answered := slices.ContainsFunc(q.Sites, func(s probe.QUICResult) bool { return s.Status == "OK" })
 	if len(q.Sites) > 0 && q.Control == "" && !answered {
-		fmt.Fprintln(out, "  • QUIC за рубеж не проходит вообще: Hysteria2, TUIC и HTTP/3 работать не будут, нужен VPN поверх TCP (например, VLESS Reality).")
+		if !vpnOn {
+			fmt.Fprintln(out, "  • QUIC за рубеж не проходит вообще: Hysteria2, TUIC и HTTP/3 работать не будут, нужен VPN поверх TCP (например, VLESS Reality).")
+		}
 	} else if len(q.Sites) > 0 {
 		tlsDown := map[string]bool{}
 		for _, t := range tls {
 			tlsDown[t.Domain] = t.Status != "OK" && t.Status != "DNS FAIL"
 		}
-		ok, sni, toRU, fake := 0, 0, 0, 0
+		ok, sni, toRU, fake, miss := 0, 0, 0, 0, 0
 		var onlyQUIC []string
 		for _, s := range q.Sites {
+			if s.ControlMiss {
+				miss++
+			}
 			switch {
 			case s.Status == "OK":
 				ok++
@@ -542,13 +547,27 @@ func printQUICSummary(q probe.QUICReport, tls []probe.TLSResult, vpnOn bool) {
 				}
 			}
 		}
-		fmt.Fprintf(out, "  • QUIC: отвечают %d из %d сайтов, режут по SNI: %d.", ok, len(q.Sites), sni)
-		if sni > 0 {
-			fmt.Fprint(out, " Часть имён режут и в QUIC: для Hysteria2 и TUIC берите нейтральный SNI.")
-		} else if ok > 0 {
-			fmt.Fprint(out, " UDP за рубеж проходит хотя бы к части адресов; свой сервер проверьте: -target адрес:порт.")
+		// Names closed on TLS that still answer QUIC with their own SNI mean
+		// the name is not inspected. A silent control beside that is loss.
+		if len(onlyQUIC) > 0 {
+			fmt.Fprintf(out, "  • QUIC: отвечают %d из %d сайтов.", ok, len(q.Sites))
+			if miss == 0 && sni == 0 && ok > 0 {
+				fmt.Fprint(out, " UDP за рубеж проходит хотя бы к части адресов; свой сервер проверьте: -target адрес:порт.")
+			}
+			fmt.Fprintln(out)
+			if miss > 0 {
+				fmt.Fprintf(out, "  • Сверочный сервер не ответил на %d %s — вероятно, потери.\n",
+					miss, ruCount(miss, "имя", "имени", "имён"))
+			}
+		} else {
+			fmt.Fprintf(out, "  • QUIC: отвечают %d из %d сайтов, режут по SNI: %d.", ok, len(q.Sites), sni)
+			if sni > 0 {
+				fmt.Fprint(out, " Часть имён режут и в QUIC: для Hysteria2 и TUIC берите нейтральный SNI.")
+			} else if ok > 0 {
+				fmt.Fprint(out, " UDP за рубеж проходит хотя бы к части адресов; свой сервер проверьте: -target адрес:порт.")
+			}
+			fmt.Fprintln(out)
 		}
-		fmt.Fprintln(out)
 		if len(onlyQUIC) > 0 {
 			fmt.Fprintf(out, "  • По TLS закрыты, а по QUIC отвечают: %d (%s) — имя в QUIC здесь не проверяют.\n",
 				len(onlyQUIC), clip(strings.Join(onlyQUIC, ", "), 80))
@@ -601,6 +620,58 @@ func printTCP16(rs []probe.TCP16Result) {
 			fatCell(r.Up), fatCell(r.Down), r.Verdict, strings.Join(r.WhiteSNI, ", "))
 	}
 	w.Flush()
+}
+
+func dash(s string) string {
+	if s == "" {
+		return "—"
+	}
+	return s
+}
+
+func ruCount(n int, one, few, many string) string {
+	if n < 0 {
+		n = -n
+	}
+	if n%100 >= 11 && n%100 <= 14 {
+		return many
+	}
+	switch n % 10 {
+	case 1:
+		return one
+	case 2, 3, 4:
+		return few
+	default:
+		return many
+	}
+}
+
+func tcp16SummaryLine(rs []probe.TCP16Result) string {
+	hit, ok, drop := 0, 0, 0
+	var clean []string
+	for _, t := range rs {
+		switch t.Verdict {
+		case "DETECTED":
+			hit++
+		case "OK":
+			ok++
+			if !slices.Contains(clean, t.Target.Provider) {
+				clean = append(clean, t.Target.Provider)
+			}
+		case "TLS DROP":
+			drop++
+		}
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "  • Обрыв 16–20 КБ: подтверждён у %d из %d", hit, len(rs))
+	if drop > 0 {
+		fmt.Fprintf(&b, ", ещё %d %s на рукопожатии (TLS DROP)", drop, ruCount(drop, "рвётся", "рвутся", "рвутся"))
+	}
+	fmt.Fprintf(&b, ", чисто у %d.", ok)
+	if len(clean) > 0 && hit > 0 {
+		fmt.Fprintf(&b, " Без обрыва: %s.", clip(strings.Join(clean, ", "), 120))
+	}
+	return b.String()
 }
 
 func fatCell(f probe.FatResult) string {
