@@ -322,6 +322,26 @@ func stringsHasCut(v string) bool {
 	return len(v) >= len("имя режется") && (bytes.HasPrefix([]byte(v), []byte("имя режется")) || bytes.HasPrefix([]byte(v), []byte("DPI по SNI")))
 }
 
+func TestRefineSilenceClearsControlMiss(t *testing.T) {
+	p := New(time.Second, 1)
+	r := &QUICResult{Domain: "youtube.com", Status: "NO REPLY", Verdict: "адрес по QUIC не отвечает", ControlMiss: true}
+	p.refineSilence(r, "", true, false)
+	if r.ControlMiss {
+		t.Fatal("googleSTUN left ControlMiss")
+	}
+	if r.Verdict != "UDP до Google проходит (STUN), QUIC молчит — режут QUIC, не весь UDP" {
+		t.Fatalf("googleSTUN verdict %q", r.Verdict)
+	}
+	r = &QUICResult{Domain: "google.com", Status: "NO REPLY", Verdict: "адрес по QUIC не отвечает", ControlMiss: true}
+	p.refineSilence(r, "", false, true)
+	if r.ControlMiss {
+		t.Fatal("googleSilent left ControlMiss")
+	}
+	if r.Verdict != "UDP до Google молчит и по STUN, и по QUIC" {
+		t.Fatalf("googleSilent verdict %q", r.Verdict)
+	}
+}
+
 func TestQUICControlRetriesSilentName(t *testing.T) {
 	pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {

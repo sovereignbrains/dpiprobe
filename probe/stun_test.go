@@ -65,6 +65,22 @@ func TestSTUNTooFastKeepsSourceAndMapped(t *testing.T) {
 	}
 }
 
+func TestStunFromAsked(t *testing.T) {
+	asked := net.ParseIP("8.8.8.8")
+	if !stunFromAsked(&net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 19302}, asked) {
+		t.Fatal("same IP")
+	}
+	if stunFromAsked(&net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 19302}, asked) {
+		t.Fatal("foreign IP")
+	}
+	if stunFromAsked(&net.UDPAddr{IP: net.ParseIP("8.8.8.8"), Port: 1}, net.ParseIP("2001:db8::1")) {
+		t.Fatal("v4 vs v6")
+	}
+	if stunFromAsked(nil, asked) || stunFromAsked(&net.UDPAddr{Port: 19302}, asked) {
+		t.Fatal("nil")
+	}
+}
+
 func stunSuccess(txid []byte, ip net.IP, port int) []byte {
 	ip4 := ip.To4()
 	xport := port ^ 0x2112

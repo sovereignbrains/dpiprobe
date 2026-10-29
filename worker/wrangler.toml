@@ -6,3 +6,8 @@ workers_dev = true
 # account_id is not stored in this repo. Set CLOUDFLARE_ACCOUNT_ID to deploy.
 # RATE — KV namespace titled dpiprobe-reports (rate limit and fallback store).
 # REPORTS — R2 bucket dpiprobe-reports, only when R2 is enabled on the account.
+# Without REPORTS the worker stores gzip JSON in RATE under rep:, TTL 90 days.
+
+[[kv_namespaces]]
+binding = "RATE"
+id = "aa85db11bdaf409fb4ac1da75abf67e6"

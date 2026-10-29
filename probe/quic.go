@@ -683,8 +683,10 @@ func (p *Prober) refineSilence(r *QUICResult, icmp string, googleSTUN, googleSil
 	}
 	switch {
 	case googleSTUN:
+		r.ControlMiss = false
 		r.Verdict = "UDP до Google проходит (STUN), QUIC молчит — режут QUIC, не весь UDP"
 	case googleSilent:
+		r.ControlMiss = false
 		r.Verdict = "UDP до Google молчит и по STUN, и по QUIC"
 	}
 }

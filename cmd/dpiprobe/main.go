@@ -485,7 +485,7 @@ func printQUIC(q probe.QUICReport) {
 		for _, s := range q.STUN {
 			switch {
 			case s.OK:
-				parts = append(parts, fmt.Sprintf("%s %s", s.Name, ms(s.RTT)))
+				parts = append(parts, fmt.Sprintf("%s ответил %s, видит нас как %s (%s)", s.Name, dash(s.ReplyAddr), dash(s.MappedAddr), ms(s.RTT)))
 			case s.RTT > 0 && s.Err != "":
 				parts = append(parts, fmt.Sprintf("%s: %s (%s)", s.Name, s.Err, ms(s.RTT)))
 			case s.Err != "":
@@ -799,24 +799,7 @@ func printSummary(r report) {
 		printQUICSummary(*r.QUIC, r.TLS, r.Net != nil && len(r.Net.VPNIfaces) > 0)
 	}
 	if r.TCP16 != nil {
-		hit, ok := 0, 0
-		var clean []string
-		for _, t := range r.TCP16 {
-			switch t.Verdict {
-			case "DETECTED":
-				hit++
-			case "OK":
-				ok++
-				if !slices.Contains(clean, t.Target.Provider) {
-					clean = append(clean, t.Target.Provider)
-				}
-			}
-		}
-		fmt.Fprintf(out, "  • Обрыв 16–20 КБ: подтверждён у %d из %d, чисто у %d.", hit, len(r.TCP16), ok)
-		if len(clean) > 0 && hit > 0 {
-			fmt.Fprintf(out, " Без обрыва: %s.", clip(strings.Join(clean, ", "), 120))
-		}
-		fmt.Fprintln(out)
+		fmt.Fprintln(out, tcp16SummaryLine(r.TCP16))
 	}
 	if r.Telegram != nil {
 		up := 0

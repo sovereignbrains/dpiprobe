@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sovereignbrains/dpiprobe/probe"
 )
@@ -93,5 +94,62 @@ func TestTCP16SummaryCountsHandshakeDrops(t *testing.T) {
 	want := "подтверждён у 56 из 110, ещё 20 рвутся на рукопожатии (TLS DROP), чисто у 19."
 	if !strings.Contains(line, want) {
 		t.Fatalf("got %q", line)
+	}
+}
+func TestPrintSummaryTCP16HandshakeDrops(t *testing.T) {
+	var rs []probe.TCP16Result
+	for range 56 {
+		rs = append(rs, probe.TCP16Result{Verdict: "DETECTED"})
+	}
+	for range 20 {
+		rs = append(rs, probe.TCP16Result{Verdict: "TLS DROP"})
+	}
+	for range 19 {
+		rs = append(rs, probe.TCP16Result{Verdict: "OK", Target: probe.Target{Provider: "Hetzner"}})
+	}
+	for len(rs) < 110 {
+		rs = append(rs, probe.TCP16Result{Verdict: "SYN DROP"})
+	}
+	got := capture(t, func() { printSummary(report{TCP16: rs}) })
+	want := "подтверждён у 56 из 110, ещё 20 рвутся на рукопожатии (TLS DROP), чисто у 19."
+	if !strings.Contains(got, want) {
+		t.Fatalf("printSummary out:\n%s", got)
+	}
+}
+
+func TestPrintQUICSTUNWhoAnswered(t *testing.T) {
+	q := probe.QUICReport{
+		STUN: []probe.STUNResult{{
+			Name:       "Cloudflare",
+			OK:         true,
+			RTT:        7 * time.Millisecond,
+			ReplyAddr:  "162.159.36.1:3478",
+			MappedAddr: "203.0.113.10:40000",
+		}},
+	}
+	got := capture(t, func() { printQUIC(q) })
+	want := "Cloudflare ответил 162.159.36.1:3478, видит нас как 203.0.113.10:40000 (7 мс)"
+	if !strings.Contains(got, want) {
+		t.Fatalf("printQUIC out:\n%s", got)
+	}
+}
+
+func TestPrintQUICSummaryAfterGoogleSTUN(t *testing.T) {
+	// Shape after refineSilence(googleSTUN): ControlMiss cleared, STUN verdict.
+	q := probe.QUICReport{
+		Control: "203.0.113.10",
+		Sites: []probe.QUICResult{{
+			Domain:      "youtube.com",
+			Status:      "NO REPLY",
+			Verdict:     "UDP до Google проходит (STUN), QUIC молчит — режут QUIC, не весь UDP",
+			ControlMiss: false,
+		}},
+	}
+	got := capture(t, func() { printQUICSummary(q, nil, false) })
+	if strings.Contains(got, "Сверочный сервер не ответил") {
+		t.Fatalf("ControlMiss still counted:\n%s", got)
+	}
+	if !strings.Contains(got, "UDP до Google проходит (STUN)") {
+		t.Fatalf("missing STUN verdict in summary:\n%s", got)
 	}
 }

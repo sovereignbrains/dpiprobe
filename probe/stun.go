@@ -106,6 +106,9 @@ func (p *Prober) stun(ctx context.Context, ip string, port int) (time.Duration, 
 		}
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err == nil && stunReply(buf[:n], req[8:20]) {
+			if !stunFromAsked(addr, dstIP) {
+				continue
+			}
 			rtt := time.Since(t0)
 			from := ""
 			if addr != nil {
@@ -132,6 +135,15 @@ func (p *Prober) stun(ctx context.Context, ip string, port int) (time.Duration, 
 func stunReply(b, txid []byte) bool {
 	return len(b) >= 20 && b[0] == 0x01 && b[1] == 0x01 &&
 		string(b[4:8]) == string(stunMagic) && string(b[8:20]) == string(txid)
+}
+
+// stunFromAsked is true when the UDP source IP is the host we queried.
+// A matching txid from someone else is not an answer from that host.
+func stunFromAsked(got *net.UDPAddr, asked net.IP) bool {
+	if got == nil || asked == nil || got.IP == nil {
+		return false
+	}
+	return got.IP.Equal(asked)
 }
 
 // stunMapped reads XOR-MAPPED-ADDRESS (RFC 5389, 0x0020). Empty if it is absent.
